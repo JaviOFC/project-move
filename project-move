@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+"""
+project-move: Seamlessly move Claude Code projects without losing state.
+
+Handles all 15 things that break when you move a project directory:
+  1-5. Path-encoded dirs in ~/.claude/ (projects, file-history, todos, shell-snapshots, debug)
+  6.   Session .jsonl content (path strings inside transcripts)
+  7.   history.jsonl (master session index)
+  8.   ~/.claude.json (permission entries keyed to old path)
+  9.   installed_plugins.json (projectPath scope entries)
+  10.  Project's own settings.local.json (permission entries)
+  11.  Other projects' settings.local.json (cross-references)
+  12.  Memory file content (paths inside .md files)
+  13.  Prefix overlap protection (refuses dangerous moves)
+  14.  Tilde-form path handling (~/... and /Users/.../)
+  15.  Dry-run mode (default — shows everything before touching anything)
+
+Usage:
+  project-move <old_path> <new_path>                          # dry-run (default)
+  project-move <old_path> <new_path> --execute                # actually do it
+  project-move <old_path> <new_path> --execute --no-backup    # skip history.jsonl backup
+  project-move --context-only <old_path> <new_path>           # update state only (dir already moved)
+  project-move --context-only <old_path> <new_path> --execute # execute context-only update
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+
+CLAUDE_DIR = Path.home() / ".claude"
+CLAUDE_JSON = Path.home() / ".claude.json"
+HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
+PLUGINS_FILE = CLAUDE_DIR / "plugins" / "installed_plugins.json"
+PATH_ENCODED_DIRS = ["projects", "file-history", "todos", "shell-snapshots", "debug"]
+HOME = str(Path.home())
+
+
+def encode_path(path: str) -> str:
+    """Encode a path the way Claude Code does: replace /._<space> with -"""
+    return re.sub(r"[/\._ ]", "-", path)
+
+
+def resolve_absolute(path: str) -> str:
+    """Resolve a path to absolute, expanding ~ and symlinks."""
+    return str(Path(path).expanduser().resolve())
+
+
+def tilde_form(path: str) -> str:
+    """Convert absolute path to ~/... form."""
+    if path.startswith(HOME):
+        return "~" + path[len(HOME):]
+    return path
+
+
+def check_prefix_overlap(old: str, new: str) -> bool:
+    """Return True if old path is a prefix of new path (dangerous for sed)."""
+    return new.startswith(old + "/") or new.startswith(old)
+
+
+class ProjectMover:
+    def __init__(self, old_path: str, new_path: str, execute: bool = False, backup: bool = True, context_only: bool = False):
+        self.context_only = context_only
+
+        if context_only:
+            # In context-only mode, old dir no longer exists — must use absolute paths
+            self.old_abs = str(Path(old_path).expanduser()) if old_path.startswith("~") else old_path
+            if not os.path.isabs(self.old_abs):
+                self.old_abs = str(Path.cwd() / self.old_abs)
+            self.new_abs = resolve_absolute(new_path)
+        else:
+            self.old_abs = resolve_absolute(old_path)
+            self.new_abs = resolve_absolute(new_path) if os.path.isabs(new_path) or new_path.startswith("~") else str(Path(new_path).resolve())
+            # For new paths that don't exist yet, resolve relative to cwd
+            if not Path(self.new_abs).exists() and not os.path.isabs(new_path) and not new_path.startswith("~"):
+                self.new_abs = str(Path.cwd() / new_path)
+
+        self.old_tilde = tilde_form(self.old_abs)
+        self.new_tilde = tilde_form(self.new_abs)
+        self.old_encoded = encode_path(self.old_abs)
+        self.new_encoded = encode_path(self.new_abs)
+        self.execute = execute
+        self.backup = backup
+        self.actions: list[dict] = []
+        self.warnings: list[str] = []
+
+    def log_action(self, category: str, description: str, details: str = ""):
+        self.actions.append({"category": category, "description": description, "details": details})
+
+    def warn(self, msg: str):
+        self.warnings.append(msg)
+
+    def preflight(self) -> bool:
+        """Run preflight checks. Returns False if move should be aborted."""
+        ok = True
+
+        if self.context_only:
+            # In context-only mode, old dir is gone, new dir must exist
+            if Path(self.old_abs).is_dir():
+                self.warn("Source directory still exists — are you sure you need --context-only?")
+            if not Path(self.new_abs).is_dir():
+                print(f"ERROR: New directory does not exist: {self.new_abs}")
+                print(f"  --context-only expects the directory to already be at the new location.")
+                ok = False
+        else:
+            # Normal mode: old dir must exist, new dir must NOT exist
+            if not Path(self.old_abs).is_dir():
+                print(f"ERROR: Source directory does not exist: {self.old_abs}")
+                ok = False
+
+            if Path(self.new_abs).exists():
+                if self.execute:
+                    ok = self._handle_destination_conflict()
+                else:
+                    print(f"ERROR: Destination already exists: {self.new_abs}")
+                    print(f"  Use --execute to get interactive merge/clean/abort options.")
+                    ok = False
+
+            # Destination parent must exist
+            new_parent = Path(self.new_abs).parent
+            if not new_parent.is_dir():
+                print(f"ERROR: Destination parent does not exist: {new_parent}")
+                ok = False
+
+        # Prefix overlap check
+        if check_prefix_overlap(self.old_abs, self.new_abs):
+            print(f"ERROR: Prefix overlap detected!")
+            print(f"  Old: {self.old_abs}")
+            print(f"  New: {self.new_abs}")
+            print(f"  A sed replacement of '{self.old_abs}' would also match '{self.new_abs}',")
+            print(f"  causing double-substitution. Use bounded sed or a different path structure.")
+            ok = False
+
+        if check_prefix_overlap(self.old_tilde, self.new_tilde):
+            # Only warn if the absolute check didn't already catch it
+            if not check_prefix_overlap(self.old_abs, self.new_abs):
+                print(f"WARNING: Tilde-form prefix overlap: {self.old_tilde} → {self.new_tilde}")
+                self.warn("Tilde-form prefix overlap — will use bounded replacements")
+
+        return ok
+
+    def _handle_destination_conflict(self) -> bool:
+        """Interactive prompt when destination directory already exists."""
+        print(f"\nDestination already exists: {self.new_abs}")
+
+        # Check for Claude context at destination
+        dest_sessions = 0
+        dest_context_dir = CLAUDE_DIR / "projects" / self.new_encoded
+        if dest_context_dir.exists():
+            dest_sessions = len(list(dest_context_dir.glob("*.jsonl")))
+
+        if dest_sessions > 0:
+            print(f"  Claude context exists at destination ({dest_sessions} sessions)")
+
+        print(f"\n  Options:")
+        print(f"    [c] Clean — delete destination dir + its Claude context, then move")
+        print(f"    [m] Merge — move source files into destination, merge Claude context")
+        print(f"    [n] Abort (default)")
+        print()
+
+        try:
+            choice = input("  Choose [c/m/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Aborted.")
+            return False
+
+        if choice == "c":
+            print(f"  Cleaning destination...")
+            shutil.rmtree(self.new_abs)
+            # Clean destination Claude context too
+            for subdir in PATH_ENCODED_DIRS:
+                dest_path = CLAUDE_DIR / subdir / self.new_encoded
+                if dest_path.exists():
+                    shutil.rmtree(dest_path)
+            print(f"  Cleaned. Proceeding with move.")
+            return True
+        elif choice == "m":
+            self._merge_mode = True
+            print(f"  Will merge into existing destination.")
+            return True
+        else:
+            print(f"  Aborted.")
+            return False
+
+    def scan_encoded_dirs(self):
+        """Items 1-5: Find path-encoded directories that need renaming."""
+        for subdir in PATH_ENCODED_DIRS:
+            old_path = CLAUDE_DIR / subdir / self.old_encoded
+            if old_path.exists():
+                new_path = CLAUDE_DIR / subdir / self.new_encoded
+                conflict = " (MERGE — destination exists)" if new_path.exists() else ""
+                self.log_action(
+                    f"encoded-dir/{subdir}",
+                    f"Rename {subdir}/{self.old_encoded} → {subdir}/{self.new_encoded}{conflict}",
+                    str(old_path),
+                )
+
+    def scan_session_files(self):
+        """Item 6: Find session .jsonl files that contain the old path."""
+        projects_dir = CLAUDE_DIR / "projects" / self.new_encoded
+        # After rename, files will be in new_encoded dir. During dry-run, check old_encoded.
+        check_dir = CLAUDE_DIR / "projects" / self.old_encoded
+        if not check_dir.exists():
+            return
+
+        count = 0
+        for jsonl in check_dir.glob("*.jsonl"):
+            try:
+                content = jsonl.read_text(errors="replace")
+                if self.old_abs in content:
+                    count += 1
+            except Exception:
+                pass
+
+        if count > 0:
+            self.log_action(
+                "session-content",
+                f"Update {count} session .jsonl file(s) — replace path strings inside transcripts",
+                f"Replace: {self.old_abs} → {self.new_abs}",
+            )
+
+    def scan_history(self):
+        """Item 7: Check history.jsonl for old path references."""
+        if not HISTORY_FILE.exists():
+            return
+
+        count = 0
+        try:
+            for line in HISTORY_FILE.read_text(errors="replace").splitlines():
+                if self.old_abs in line:
+                    count += 1
+        except Exception:
+            pass
+
+        if count > 0:
+            self.log_action(
+                "history.jsonl",
+                f"Update {count} line(s) in history.jsonl",
+                f"Replace: {self.old_abs} → {self.new_abs}",
+            )
+
+    def scan_claude_json(self):
+        """Item 8: Check ~/.claude.json for permission entries keyed to old path."""
+        if not CLAUDE_JSON.exists():
+            return
+
+        try:
+            content = CLAUDE_JSON.read_text()
+            # Count occurrences of old path in the JSON
+            abs_count = content.count(self.old_abs)
+            tilde_count = content.count(self.old_tilde)
+            total = abs_count + tilde_count
+
+            if total > 0:
+                self.log_action(
+                    "claude.json",
+                    f"Update {total} reference(s) in ~/.claude.json ({abs_count} absolute, {tilde_count} tilde)",
+                    "Permission entries and project keys",
+                )
+        except Exception:
+            pass
+
+    def scan_plugins(self):
+        """Item 9: Check installed_plugins.json for projectPath entries."""
+        if not PLUGINS_FILE.exists():
+            return
+
+        try:
+            data = json.loads(PLUGINS_FILE.read_text())
+            count = 0
+            plugins = data.get("plugins", {}) if isinstance(data, dict) else {}
+            for name, entries in plugins.items():
+                if isinstance(entries, list):
+                    for entry in entries:
+                        pp = entry.get("projectPath", "")
+                        if self.old_abs in pp or self.old_tilde in pp:
+                            count += 1
+
+            if count > 0:
+                self.log_action(
+                    "plugins",
+                    f"Update {count} projectPath entry/entries in installed_plugins.json",
+                    f"Replace: {self.old_abs} → {self.new_abs}",
+                )
+        except Exception:
+            pass
+
+    def scan_project_settings(self):
+        """Item 10: Check the project's own settings.local.json."""
+        settings_file = Path(self.old_abs) / ".claude" / "settings.local.json"
+        if not settings_file.exists():
+            return
+
+        try:
+            content = settings_file.read_text()
+            abs_count = content.count(self.old_abs)
+            tilde_count = content.count(self.old_tilde)
+            total = abs_count + tilde_count
+
+            if total > 0:
+                self.log_action(
+                    "own-settings",
+                    f"Update {total} reference(s) in project's own settings.local.json",
+                    str(settings_file),
+                )
+        except Exception:
+            pass
+
+    def scan_cross_project_settings(self):
+        """Item 11: Check other projects' settings.local.json for cross-references."""
+        developer_dir = Path(self.old_abs).parent
+        # Safety: only scan within ~/Developer/ to avoid traversing all of ~/
+                # Safety: don't rglob above the project's parent (avoids traversing all of ~/)
+        if developer_dir == Path(HOME) or developer_dir == Path("/"):
+            return
+
+        found = []
+        for settings_file in developer_dir.rglob(".claude/settings.local.json"):
+            # Skip the project being moved
+            if str(settings_file).startswith(self.old_abs):
+                continue
+            try:
+                content = settings_file.read_text()
+                if self.old_abs in content or self.old_tilde in content:
+                    rel = str(settings_file.relative_to(developer_dir))
+                    found.append(rel)
+            except Exception:
+                pass
+
+        if found:
+            self.log_action(
+                "cross-project-settings",
+                f"Update {len(found)} other project(s)' settings.local.json with cross-references",
+                "\n".join(f"  - {f}" for f in found),
+            )
+
+    def scan_memory_files(self):
+        """Item 12: Check memory files for path references."""
+        memory_base = CLAUDE_DIR / "projects"
+        if not memory_base.exists():
+            return
+
+        found = []
+        for md_file in memory_base.rglob("memory/*.md"):
+            try:
+                content = md_file.read_text()
+                if self.old_abs in content or self.old_tilde in content:
+                    found.append(str(md_file.relative_to(CLAUDE_DIR)))
+            except Exception:
+                pass
+
+        if found:
+            self.log_action(
+                "memory-files",
+                f"Update {len(found)} memory file(s) with path references",
+                "\n".join(f"  - {f}" for f in found),
+            )
+
+    def scan_all(self):
+        """Run all scans."""
+        self.scan_encoded_dirs()
+        self.scan_session_files()
+        self.scan_history()
+        self.scan_claude_json()
+        self.scan_plugins()
+        self.scan_project_settings()
+        self.scan_cross_project_settings()
+        self.scan_memory_files()
+
+    def execute_encoded_dirs(self):
+        """Execute items 1-5: Rename path-encoded directories."""
+        for subdir in PATH_ENCODED_DIRS:
+            old_path = CLAUDE_DIR / subdir / self.old_encoded
+            new_path = CLAUDE_DIR / subdir / self.new_encoded
+
+            if not old_path.exists():
+                continue
+
+            if new_path.exists():
+                # Merge: move all files from old to new
+                for item in old_path.iterdir():
+                    dest = new_path / item.name
+                    if not dest.exists():
+                        shutil.move(str(item), str(dest))
+                # Remove old dir if empty
+                try:
+                    old_path.rmdir()
+                except OSError:
+                    shutil.rmtree(old_path)
+            else:
+                old_path.rename(new_path)
+
+    def execute_session_content(self):
+        """Execute item 6: Update session file contents."""
+        session_dir = CLAUDE_DIR / "projects" / self.new_encoded
+        if not session_dir.exists():
+            return
+
+        for jsonl in session_dir.glob("*.jsonl"):
+            try:
+                content = jsonl.read_text(errors="replace")
+                if self.old_abs in content:
+                    updated = content.replace(self.old_abs, self.new_abs)
+                    jsonl.write_text(updated)
+            except Exception as e:
+                self.warn(f"Failed to update session file {jsonl.name}: {e}")
+
+    def execute_history(self):
+        """Execute item 7: Update history.jsonl."""
+        if not HISTORY_FILE.exists():
+            return
+
+        if self.backup:
+            backup_path = HISTORY_FILE.with_suffix(".jsonl.pre-move-backup")
+            shutil.copy2(HISTORY_FILE, backup_path)
+
+        content = HISTORY_FILE.read_text(errors="replace")
+        # Use bounded replacement to avoid prefix issues
+        # Replace the exact quoted form first (most common in JSON)
+        updated = content.replace(f'"{self.old_abs}"', f'"{self.new_abs}"')
+        # Then any remaining unquoted references
+        if self.old_abs in updated:
+            updated = updated.replace(self.old_abs, self.new_abs)
+        HISTORY_FILE.write_text(updated)
+
+    def execute_claude_json(self):
+        """Execute item 8: Update ~/.claude.json permission entries."""
+        if not CLAUDE_JSON.exists():
+            return
+
+        content = CLAUDE_JSON.read_text()
+        updated = content.replace(self.old_abs, self.new_abs)
+        updated = updated.replace(self.old_tilde, self.new_tilde)
+        if updated != content:
+            CLAUDE_JSON.write_text(updated)
+
+    def execute_plugins(self):
+        """Execute item 9: Update installed_plugins.json."""
+        if not PLUGINS_FILE.exists():
+            return
+
+        content = PLUGINS_FILE.read_text()
+        # Use string replacement on the raw JSON to preserve formatting
+        updated = content.replace(self.old_abs, self.new_abs)
+        updated = updated.replace(self.old_tilde, self.new_tilde)
+        if updated != content:
+            # Validate JSON before writing
+            json.loads(updated)
+            PLUGINS_FILE.write_text(updated)
+
+    def execute_project_settings(self):
+        """Execute item 10: Update project's own settings.local.json."""
+        # After directory move, the file is at the new location
+        settings_file = Path(self.new_abs) / ".claude" / "settings.local.json"
+        if not settings_file.exists():
+            return
+
+        content = settings_file.read_text()
+        updated = content.replace(self.old_abs, self.new_abs)
+        updated = updated.replace(self.old_tilde, self.new_tilde)
+        if updated != content:
+            settings_file.write_text(updated)
+
+    def execute_cross_project_settings(self):
+        """Execute item 11: Update other projects' settings.local.json."""
+        developer_dir = Path(self.new_abs).parent
+        if developer_dir == Path(HOME) or developer_dir == Path("/"):
+            return
+
+        for settings_file in developer_dir.rglob(".claude/settings.local.json"):
+            if str(settings_file).startswith(self.new_abs):
+                continue
+            try:
+                content = settings_file.read_text()
+                updated = content.replace(self.old_abs, self.new_abs)
+                updated = updated.replace(self.old_tilde, self.new_tilde)
+                if updated != content:
+                    settings_file.write_text(updated)
+            except Exception as e:
+                self.warn(f"Failed to update {settings_file}: {e}")
+
+    def execute_memory_files(self):
+        """Execute item 12: Update memory files."""
+        memory_base = CLAUDE_DIR / "projects"
+        if not memory_base.exists():
+            return
+
+        for md_file in memory_base.rglob("memory/*.md"):
+            try:
+                content = md_file.read_text()
+                updated = content.replace(self.old_abs, self.new_abs)
+                updated = updated.replace(self.old_tilde, self.new_tilde)
+                if updated != content:
+                    md_file.write_text(updated)
+            except Exception as e:
+                self.warn(f"Failed to update memory file {md_file}: {e}")
+
+    def execute_move(self):
+        """Execute the full move sequence."""
+        print(f"\n{'='*60}")
+        print(f" EXECUTING MOVE")
+        print(f"{'='*60}\n")
+
+        print("[1/8] Renaming path-encoded directories...")
+        self.execute_encoded_dirs()
+
+        print("[2/8] Updating session file contents...")
+        self.execute_session_content()
+
+        print("[3/8] Updating history.jsonl...")
+        self.execute_history()
+
+        if self.context_only:
+            print("[4/8] Skipping directory move (--context-only)")
+        elif getattr(self, "_merge_mode", False):
+            print("[4/8] Merging directory contents...")
+            src = Path(self.old_abs)
+            dst = Path(self.new_abs)
+            for item in src.iterdir():
+                dest_item = dst / item.name
+                if not dest_item.exists():
+                    shutil.move(str(item), str(dest_item))
+                else:
+                    self.warn(f"Skipped {item.name} — already exists at destination")
+            # Remove source if empty
+            try:
+                src.rmdir()
+            except OSError:
+                self.warn(f"Source dir not empty after merge — some files remain at {src}")
+        else:
+            print("[4/8] Moving directory...")
+            Path(self.old_abs).rename(Path(self.new_abs))
+
+        print("[5/8] Updating ~/.claude.json...")
+        self.execute_claude_json()
+
+        print("[6/8] Updating installed_plugins.json...")
+        self.execute_plugins()
+
+        print("[7/8] Updating settings.local.json files...")
+        self.execute_project_settings()
+        self.execute_cross_project_settings()
+
+        print("[8/8] Updating memory files...")
+        self.execute_memory_files()
+
+        print(f"\nDone. Moved {self.old_abs} → {self.new_abs}")
+
+        if self.warnings:
+            print(f"\nWarnings ({len(self.warnings)}):")
+            for w in self.warnings:
+                print(f"  ! {w}")
+
+    def print_plan(self):
+        """Print the dry-run plan."""
+        print(f"\n{'='*60}")
+        print(f" PROJECT-MOVE — DRY RUN")
+        print(f"{'='*60}")
+        print(f"\n  From: {self.old_abs}")
+        print(f"    To: {self.new_abs}")
+        print(f"\n  Old encoded: {self.old_encoded}")
+        print(f"  New encoded: {self.new_encoded}")
+
+        if self.warnings:
+            print(f"\n  Warnings:")
+            for w in self.warnings:
+                print(f"    ! {w}")
+
+        if not self.actions:
+            print(f"\n  No Claude Code state found for this project.")
+            print(f"  Only the directory itself would be moved.")
+        else:
+            print(f"\n  {len(self.actions)} action(s) planned:\n")
+            for i, action in enumerate(self.actions, 1):
+                print(f"  [{i:2d}] {action['category']}")
+                print(f"       {action['description']}")
+                if action["details"]:
+                    for line in action["details"].splitlines():
+                        print(f"       {line}")
+                print()
+
+        if self.context_only:
+            print(f"  (directory already at new location — context-only mode)")
+        else:
+            print(f"  + Move directory: {self.old_abs} → {self.new_abs}")
+        ctx_flag = "--context-only " if self.context_only else ""
+        print(f"\n{'='*60}")
+        print(f"  To execute: project-move {ctx_flag}{self.old_abs} {self.new_abs} --execute")
+        print(f"{'='*60}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Seamlessly move Claude Code projects without losing state.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Dry-run by default. Use --execute to actually perform the move.",
+    )
+    parser.add_argument("old_path", help="Current (or former) project directory path")
+    parser.add_argument("new_path", help="Destination path for the project")
+    parser.add_argument("--execute", action="store_true", help="Actually perform the move (default: dry-run)")
+    parser.add_argument("--no-backup", action="store_true", help="Skip history.jsonl backup")
+    parser.add_argument("--context-only", action="store_true", help="Update Claude state only — directory already moved")
+
+    args = parser.parse_args()
+
+    mover = ProjectMover(
+        old_path=args.old_path,
+        new_path=args.new_path,
+        execute=args.execute,
+        backup=not args.no_backup,
+        context_only=args.context_only,
+    )
+
+    if not mover.preflight():
+        sys.exit(1)
+
+    mover.scan_all()
+
+    if args.execute:
+        mover.execute_move()
+    else:
+        mover.print_plan()
+
+
+if __name__ == "__main__":
+    main()
