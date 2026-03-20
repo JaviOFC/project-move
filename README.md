@@ -115,7 +115,7 @@ project-move --context-only ~/old-path/my-app ~/new-path/my-app --execute
 |---|---|
 | `--execute` | Actually perform the move (default: dry-run) |
 | `--context-only` | Update Claude state only — directory already moved |
-| `--no-backup` | Skip `history.jsonl` backup |
+| `--no-backup` | Skip pre-move backup |
 
 ## Safety features
 
@@ -147,6 +147,34 @@ Destination already exists: /Users/you/projects/archive/my-app
     [c] Clean — delete destination dir + its Claude context, then move
     [m] Merge — move source files into destination, merge Claude context
     [n] Abort (default)
+```
+
+### Backup and rollback
+
+Before modifying anything, `--execute` creates a timestamped backup of every file it will touch:
+
+```
+~/.claude/backups/project-move-20260320-121500/
+├── MANIFEST.txt
+├── .claude.json
+├── .claude/history.jsonl
+├── .claude/plugins/installed_plugins.json
+└── Developer/my-app/.claude/settings.local.json
+```
+
+`MANIFEST.txt` lists every backed-up file with restore instructions. Skip with `--no-backup`.
+
+### Post-move verification
+
+After all writes complete, the tool re-scans for any remaining stale references. If anything was missed:
+
+```
+Verifying...
+
+  STALE REFERENCES FOUND (1):
+    ! session file: abc123.jsonl
+
+  Backup available at: ~/.claude/backups/project-move-20260320-121500/
 ```
 
 ### JSON validation
