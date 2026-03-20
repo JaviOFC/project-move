@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -313,8 +314,7 @@ class ProjectMover:
     def scan_cross_project_settings(self):
         """Item 11: Check other projects' settings.local.json for cross-references."""
         developer_dir = Path(self.old_abs).parent
-        # Safety: only scan within ~/Developer/ to avoid traversing all of ~/
-                # Safety: don't rglob above the project's parent (avoids traversing all of ~/)
+        # Safety: don't rglob above the project's parent (avoids traversing all of ~/)
         if developer_dir == Path(HOME) or developer_dir == Path("/"):
             return
 
@@ -359,6 +359,121 @@ class ProjectMover:
                 f"Update {len(found)} memory file(s) with path references",
                 "\n".join(f"  - {f}" for f in found),
             )
+
+    def create_backup(self) -> Path | None:
+        """Create timestamped backup of all files that will be modified. Returns backup dir path."""
+        if not self.actions:
+            return None
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_dir = CLAUDE_DIR / "backups" / f"project-move-{timestamp}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest = []
+
+        # Back up files that execute methods will modify
+        files_to_backup = []
+
+        # history.jsonl
+        if HISTORY_FILE.exists():
+            files_to_backup.append(HISTORY_FILE)
+
+        # ~/.claude.json
+        if CLAUDE_JSON.exists():
+            files_to_backup.append(CLAUDE_JSON)
+
+        # installed_plugins.json
+        if PLUGINS_FILE.exists():
+            files_to_backup.append(PLUGINS_FILE)
+
+        # Project's own settings.local.json
+        own_settings = Path(self.old_abs) / ".claude" / "settings.local.json"
+        if own_settings.exists():
+            files_to_backup.append(own_settings)
+
+        # Cross-project settings.local.json files
+        developer_dir = Path(self.old_abs).parent
+        if developer_dir != Path(HOME) and developer_dir != Path("/") and developer_dir.exists():
+            for sf in developer_dir.rglob(".claude/settings.local.json"):
+                if not str(sf).startswith(self.old_abs):
+                    try:
+                        content = sf.read_text()
+                        if self.old_abs in content or self.old_tilde in content:
+                            files_to_backup.append(sf)
+                    except Exception:
+                        pass
+
+        # Memory files
+        memory_base = CLAUDE_DIR / "projects"
+        if memory_base.exists():
+            for md_file in memory_base.rglob("memory/*.md"):
+                try:
+                    content = md_file.read_text()
+                    if self.old_abs in content or self.old_tilde in content:
+                        files_to_backup.append(md_file)
+                except Exception:
+                    pass
+
+        for f in files_to_backup:
+            rel = str(f).replace(HOME + "/", "")
+            dest = backup_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dest)
+            manifest.append(rel)
+
+        # Write manifest
+        (backup_dir / "MANIFEST.txt").write_text(
+            f"project-move backup — {timestamp}\n"
+            f"Move: {self.old_abs} → {self.new_abs}\n\n"
+            f"Files backed up ({len(manifest)}):\n"
+            + "\n".join(f"  {f}" for f in manifest)
+            + "\n\nTo restore: cp -f <backup_file> ~/<original_path>\n"
+        )
+
+        return backup_dir
+
+    def verify_move(self) -> list[str]:
+        """Post-move verification: re-scan for any remaining stale references."""
+        stale = []
+
+        # Check history.jsonl
+        if HISTORY_FILE.exists():
+            content = HISTORY_FILE.read_text(errors="replace")
+            count = content.count(self.old_abs)
+            if count > 0:
+                stale.append(f"history.jsonl: {count} stale reference(s)")
+
+        # Check ~/.claude.json
+        if CLAUDE_JSON.exists():
+            content = CLAUDE_JSON.read_text()
+            count = content.count(self.old_abs) + content.count(self.old_tilde)
+            if count > 0:
+                stale.append(f"~/.claude.json: {count} stale reference(s)")
+
+        # Check plugins
+        if PLUGINS_FILE.exists():
+            content = PLUGINS_FILE.read_text()
+            count = content.count(self.old_abs) + content.count(self.old_tilde)
+            if count > 0:
+                stale.append(f"installed_plugins.json: {count} stale reference(s)")
+
+        # Check session files in new location
+        session_dir = CLAUDE_DIR / "projects" / self.new_encoded
+        if session_dir.exists():
+            for jsonl in session_dir.glob("*.jsonl"):
+                try:
+                    if self.old_abs in jsonl.read_text(errors="replace"):
+                        stale.append(f"session file: {jsonl.name}")
+                except Exception:
+                    pass
+
+        # Check old encoded dirs still exist (shouldn't after move)
+        for subdir in PATH_ENCODED_DIRS:
+            old_path = CLAUDE_DIR / subdir / self.old_encoded
+            if old_path.exists():
+                stale.append(f"old encoded dir still exists: {subdir}/{self.old_encoded}")
+
+        return stale
 
     def scan_all(self):
         """Run all scans."""
@@ -413,10 +528,6 @@ class ProjectMover:
         """Execute item 7: Update history.jsonl."""
         if not HISTORY_FILE.exists():
             return
-
-        if self.backup:
-            backup_path = HISTORY_FILE.with_suffix(".jsonl.pre-move-backup")
-            shutil.copy2(HISTORY_FILE, backup_path)
 
         content = HISTORY_FILE.read_text(errors="replace")
         # Use bounded replacement to avoid prefix issues
@@ -500,24 +611,35 @@ class ProjectMover:
                 self.warn(f"Failed to update memory file {md_file}: {e}")
 
     def execute_move(self):
-        """Execute the full move sequence."""
+        """Execute the full move sequence with backup and verification."""
         print(f"\n{'='*60}")
         print(f" EXECUTING MOVE")
         print(f"{'='*60}\n")
 
-        print("[1/8] Renaming path-encoded directories...")
+        # Step 1: Create backup of all files that will be modified
+        if self.backup:
+            print("[1/9] Creating backup...")
+            backup_dir = self.create_backup()
+            if backup_dir:
+                print(f"       Backup: {backup_dir}")
+            else:
+                print("       No files to back up.")
+        else:
+            print("[1/9] Skipping backup (--no-backup)")
+            backup_dir = None
+
+        # Step 2-3: Rename encoded dirs + update session content (Claude state)
+        print("[2/9] Renaming path-encoded directories...")
         self.execute_encoded_dirs()
 
-        print("[2/8] Updating session file contents...")
+        print("[3/9] Updating session file contents...")
         self.execute_session_content()
 
-        print("[3/8] Updating history.jsonl...")
-        self.execute_history()
-
+        # Step 4: Move directory (the irreversible step — all reads done, writes follow)
         if self.context_only:
-            print("[4/8] Skipping directory move (--context-only)")
+            print("[4/9] Skipping directory move (--context-only)")
         elif getattr(self, "_merge_mode", False):
-            print("[4/8] Merging directory contents...")
+            print("[4/9] Merging directory contents...")
             src = Path(self.old_abs)
             dst = Path(self.new_abs)
             for item in src.iterdir():
@@ -526,29 +648,48 @@ class ProjectMover:
                     shutil.move(str(item), str(dest_item))
                 else:
                     self.warn(f"Skipped {item.name} — already exists at destination")
-            # Remove source if empty
             try:
                 src.rmdir()
             except OSError:
                 self.warn(f"Source dir not empty after merge — some files remain at {src}")
         else:
-            print("[4/8] Moving directory...")
+            print("[4/9] Moving directory...")
             Path(self.old_abs).rename(Path(self.new_abs))
 
-        print("[5/8] Updating ~/.claude.json...")
+        # Steps 5-8: Update all config/state files
+        print("[5/9] Updating history.jsonl...")
+        self.execute_history()
+
+        print("[6/9] Updating ~/.claude.json...")
         self.execute_claude_json()
 
-        print("[6/8] Updating installed_plugins.json...")
+        print("[7/9] Updating installed_plugins.json...")
         self.execute_plugins()
 
-        print("[7/8] Updating settings.local.json files...")
+        print("[8/9] Updating settings.local.json files...")
         self.execute_project_settings()
         self.execute_cross_project_settings()
 
-        print("[8/8] Updating memory files...")
+        print("[9/9] Updating memory files...")
         self.execute_memory_files()
 
+        # Post-move verification
+        print(f"\nVerifying...")
+        stale = self.verify_move()
+
+        if stale:
+            print(f"\n  STALE REFERENCES FOUND ({len(stale)}):")
+            for s in stale:
+                print(f"    ! {s}")
+            if backup_dir:
+                print(f"\n  Backup available at: {backup_dir}")
+        else:
+            print(f"  Verification passed — zero stale references.")
+
         print(f"\nDone. Moved {self.old_abs} → {self.new_abs}")
+
+        if backup_dir:
+            print(f"Backup: {backup_dir}")
 
         if self.warnings:
             print(f"\nWarnings ({len(self.warnings)}):")
