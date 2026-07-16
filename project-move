@@ -2,92 +2,649 @@
 """
 project-move: Seamlessly move Claude Code projects without losing state.
 
-Handles all 15 things that break when you move a project directory:
+Handles the things that break when you move a project directory:
   1-5. Path-encoded dirs in ~/.claude/ (projects, file-history, todos, shell-snapshots, debug)
   6.   Session .jsonl content (path strings inside transcripts)
   7.   history.jsonl (master session index)
   8.   ~/.claude.json (permission entries keyed to old path)
-  9.   installed_plugins.json (projectPath scope entries)
+  9.   installed_plugins.json (projectPath scope entries, where present)
   10.  Project's own settings.local.json (permission entries)
   11.  Other projects' settings.local.json (cross-references)
   12.  Memory file content (paths inside .md files)
-  13.  Prefix overlap protection (refuses dangerous moves)
-  14.  Tilde-form path handling (~/... and /Users/.../)
+  13.  Path-relationship protection (refuses ambiguous/dangerous moves)
+  14.  Tilde-form and platform path-form handling
   15.  Dry-run mode (default — shows everything before touching anything)
 
 Usage:
   project-move <old_path> <new_path>                          # dry-run (default)
   project-move <old_path> <new_path> --execute                # actually do it
-  project-move <old_path> <new_path> --execute --no-backup    # skip history.jsonl backup
+  project-move <old_path> <new_path> --execute --no-backup    # skip backup (blocked for merges)
   project-move --context-only <old_path> <new_path>           # update state only (dir already moved)
   project-move --context-only <old_path> <new_path> --execute # execute context-only update
+  project-move <old_path> <new_path> --execute --yes          # non-interactive (for scripting/tests)
+
+On Windows, run with the `py` launcher or `python`:
+  py project-move "C:/Development/App" "C:/Development/Archive/App"
 """
 
 import argparse
+import contextlib
+import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import sys
+import tempfile
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath, PurePosixPath
 
+EXIT_OK = 0
+EXIT_ABORTED = 1
+EXIT_PARTIAL = 2
 
-CLAUDE_DIR = Path.home() / ".claude"
-CLAUDE_JSON = Path.home() / ".claude.json"
-HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
-PLUGINS_FILE = CLAUDE_DIR / "plugins" / "installed_plugins.json"
 PATH_ENCODED_DIRS = ["projects", "file-history", "todos", "shell-snapshots", "debug"]
-HOME = str(Path.home())
 
 
-def encode_path(path: str) -> str:
-    """Encode a path the way Claude Code does: replace /._<space> with -"""
-    return re.sub(r"[/\._ ]", "-", path)
+# --------------------------------------------------------------------------
+# Environment (injectable for tests — never assume the real home directory)
+# --------------------------------------------------------------------------
+
+@dataclass
+class ClaudeEnv:
+    """Locations of Claude Code's state. Constructed from a home directory so
+    tests can point it at an isolated temp directory instead of the real one."""
+
+    home: Path
+    windows: bool
+
+    def __post_init__(self):
+        self.home = Path(self.home)
+        self.claude_dir = self.home / ".claude"
+        self.claude_json = self.home / ".claude.json"
+        self.history_file = self.claude_dir / "history.jsonl"
+        self.plugins_file = self.claude_dir / "plugins" / "installed_plugins.json"
+
+    @classmethod
+    def default(cls) -> "ClaudeEnv":
+        return cls(home=Path.home(), windows=(os.name == "nt"))
 
 
-def resolve_absolute(path: str) -> str:
-    """Resolve a path to absolute, expanding ~ and symlinks."""
-    return str(Path(path).expanduser().resolve())
+# --------------------------------------------------------------------------
+# Path encoding — verified against real Claude Code state, not assumed.
+#
+# On Windows, comparing real ~/.claude/projects/<encoded> directory names
+# against real paths recorded in ~/.claude.json showed that every character
+# outside [A-Za-z0-9-] (colons, backslashes, forward slashes, spaces, and
+# non-ASCII characters) is replaced with '-'. Case and separator style are
+# preserved verbatim (Claude Code does not normalize before encoding).
+#
+# On POSIX, only '/', '.', '_', and space are replaced (per the community
+# documentation this tool already relied on) — left unchanged here.
+# --------------------------------------------------------------------------
+
+def encode_path(path: str, windows: bool) -> str:
+    if windows:
+        return re.sub(r"[^A-Za-z0-9-]", "-", path)
+    return re.sub(r"[/._ ]", "-", path)
 
 
-def tilde_form(path: str) -> str:
-    """Convert absolute path to ~/... form."""
-    if path.startswith(HOME):
-        return "~" + path[len(HOME):]
+def tilde_form(path: str, home: str) -> str:
+    if path.startswith(home):
+        rest = path[len(home):]
+        if rest == "" or rest[0] in ("/", "\\"):
+            return "~" + rest
     return path
 
 
-def check_prefix_overlap(old: str, new: str) -> bool:
-    """Return True if old path is a prefix of new path (dangerous for sed)."""
-    return new.startswith(old + "/") or new.startswith(old)
+# --------------------------------------------------------------------------
+# Path relationship helpers — component-wise, not naive startswith() on
+# strings. Windows is case-insensitive; POSIX is case-sensitive.
+# --------------------------------------------------------------------------
 
+def _pure(path, windows: bool):
+    """Parse with the path flavor selected by the `windows` flag, not the
+    host OS — so pure path-relationship logic gives identical results for a
+    Windows-style string regardless of whether the tests happen to run on
+    Windows or Linux."""
+    flavor = PureWindowsPath if windows else PurePosixPath
+    return flavor(str(path))
+
+
+def _norm_parts(path: Path, windows: bool) -> tuple:
+    parts = _pure(path, windows).parts
+    if windows:
+        return tuple(p.lower() for p in parts)
+    return parts
+
+
+def paths_equal(a: Path, b: Path, windows: bool) -> bool:
+    """True if a and b refer to the same location. Uses samefile() when both
+    exist (handles symlinks/junctions correctly); falls back to normalized,
+    case-aware component comparison when one or both do not exist yet (the
+    common case for a move destination)."""
+    try:
+        if a.exists() and b.exists():
+            return os.path.samefile(str(a), str(b))
+    except OSError:
+        pass
+    return _norm_parts(a, windows) == _norm_parts(b, windows)
+
+
+def is_ancestor(ancestor: Path, descendant: Path, windows: bool) -> bool:
+    """True if `ancestor` is a strict parent (at any depth) of `descendant`,
+    using path components rather than string prefixes — so 'App' is never
+    mistaken as an ancestor of the sibling 'App2'."""
+    anc = _norm_parts(ancestor, windows)
+    desc = _norm_parts(descendant, windows)
+    if len(anc) >= len(desc):
+        return False
+    return desc[: len(anc)] == anc
+
+
+def same_volume(a: Path, b: Path, windows: bool) -> bool:
+    """Best-effort check for whether a rename can stay on one filesystem.
+    Prefers actual device IDs (st_dev) over comparing drive letters/anchors:
+    on POSIX every absolute path has the same anchor ('/') regardless of
+    which filesystem it's mounted on, so anchor comparison alone would
+    always (wrongly) report 'same volume' there."""
+
+    def dev_of(p: Path):
+        for candidate in (p, *p.parents):
+            try:
+                return os.stat(candidate).st_dev
+            except OSError:
+                continue
+        return None
+
+    dev_a, dev_b = dev_of(a), dev_of(b)
+    if dev_a is not None and dev_b is not None:
+        return dev_a == dev_b
+
+    a_anchor = _pure(a, windows).anchor
+    b_anchor = _pure(b, windows).anchor
+    if windows:
+        a_anchor, b_anchor = a_anchor.lower(), b_anchor.lower()
+    return a_anchor == b_anchor
+
+
+def classify_relationship(old_abs: Path, new_abs: Path, windows: bool) -> str:
+    """Returns one of: 'same', 'case-only', 'dest-inside-src', 'src-inside-dest', 'unrelated'."""
+    if paths_equal(old_abs, new_abs, windows):
+        return "case-only" if str(old_abs) != str(new_abs) else "same"
+    if is_ancestor(old_abs, new_abs, windows):
+        return "dest-inside-src"
+    if is_ancestor(new_abs, old_abs, windows):
+        return "src-inside-dest"
+    return "unrelated"
+
+
+def rename_case_only(old_abs: Path, new_abs: Path):
+    """Windows same-file, different-case (or separator-style) rename. Done via
+    a temporary intermediate name in the same parent directory so we never
+    depend on a single-step case-only rename being honored consistently."""
+    parent = old_abs.parent
+    tmp = parent / f".project-move-tmp-{uuid.uuid4().hex}"
+    os.rename(str(old_abs), str(tmp))
+    try:
+        os.rename(str(tmp), str(new_abs))
+    except Exception:
+        # Best-effort restore of the original name if the second hop fails.
+        with contextlib.suppress(OSError):
+            os.rename(str(tmp), str(old_abs))
+        raise
+
+
+# --------------------------------------------------------------------------
+# Path-reference replacement engine.
+#
+# Deliberately conservative: for JSON/JSONL files we parse the structure to
+# compute how many genuine path references *should* exist (recursing into
+# both dict keys and values — Claude Code keys ~/.claude.json's "projects"
+# map by the literal path). We then perform the actual edit with a bounded,
+# boundary-guarded text substitution over the raw bytes (so on-disk
+# formatting is preserved instead of re-serializing JSON). If the number of
+# textual replacements doesn't match the structural expectation, the file is
+# left untouched and reported as ambiguous rather than guessed at.
+# --------------------------------------------------------------------------
+
+@dataclass
+class PathVariant:
+    label: str
+    old: str
+    new: str
+
+
+def build_logical_variants(old_abs: str, new_abs: str, home: str, windows: bool) -> list:
+    """Path forms as they would appear in a *parsed* string (i.e. already
+    JSON-unescaped)."""
+    variants = []
+    seen = set()
+
+    def add(label, old_form, new_form):
+        if old_form and old_form not in seen:
+            variants.append(PathVariant(label, old_form, new_form))
+            seen.add(old_form)
+
+    if windows:
+        old_back = old_abs.replace("/", "\\")
+        new_back = new_abs.replace("/", "\\")
+        add("backslash", old_back, new_back)
+
+        old_fwd = old_abs.replace("\\", "/")
+        new_fwd = new_abs.replace("\\", "/")
+        add("forward-slash", old_fwd, new_fwd)
+
+        m = re.match(r"^([A-Za-z]):[\\/](.*)$", old_abs)
+        n = re.match(r"^([A-Za-z]):[\\/](.*)$", new_abs)
+        if m and n:
+            old_gb = f"/{m.group(1).lower()}/{m.group(2).replace(chr(92), '/')}"
+            new_gb = f"/{n.group(1).lower()}/{n.group(2).replace(chr(92), '/')}"
+            add("git-bash", old_gb, new_gb)
+    else:
+        add("posix", old_abs, new_abs)
+
+    old_tilde = tilde_form(old_abs, home)
+    new_tilde = tilde_form(new_abs, home)
+    if old_tilde != old_abs:
+        add("tilde", old_tilde, new_tilde)
+        if windows:
+            add("tilde-forward-slash", old_tilde.replace("\\", "/"), new_tilde.replace("\\", "/"))
+
+    return variants
+
+
+def _to_raw_form(text: str, json_like: bool) -> str:
+    if json_like:
+        return text.replace("\\", "\\\\")
+    return text
+
+
+# --------------------------------------------------------------------------
+# Canonical boundary matcher — the ONE place that decides whether an
+# occurrence of a path variant is a genuine, bounded reference. Both the
+# structural (parsed-JSON-string) count and the bounded (raw-text) replace
+# call into this same function, so they can never independently diverge on
+# what counts as a match — which is what let them silently disagree before.
+#
+# On raw, still-JSON-escaped text, a real newline/tab/etc. immediately
+# before a path is represented as TWO characters ("\" + "n", "\" + "t", ...),
+# and the trailing letter of that escape sequence (the 'n', the 't', ...)
+# looks exactly like an ordinary word character to a naive boundary check —
+# even though on the *parsed* string that same logical position is a single
+# control character that was never a "continuation" character in the first
+# place. Left uncorrected, this made the bounded matcher reject perfectly
+# valid references that happened to sit right after a line break inside a
+# JSON string (e.g. a directory-tree listing, or a compiler warning list),
+# while the structural count (computed on the parsed string) found them
+# fine — the exact source of "structural expected N but bounded matched M"
+# warnings on files that were actually completely safe to update.
+# --------------------------------------------------------------------------
+
+_CONTINUATION_CHARS_SET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.~-"
+)
+_JSON_ESCAPE_TAIL_CHARS = frozenset('nrtbf"\\/')
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _boundary_ok_after(text: str, pos: int) -> bool:
+    if pos >= len(text):
+        return True
+    return text[pos] not in _CONTINUATION_CHARS_SET
+
+
+def _boundary_ok_before(text: str, pos: int, escape_aware: bool) -> bool:
+    if pos <= 0:
+        return True
+    prev = text[pos - 1]
+    if prev not in _CONTINUATION_CHARS_SET:
+        return True
+    if not escape_aware:
+        return False
+    # \n, \t, \r, \b, \f, \", \\, \/ — a 2-character JSON escape whose tail
+    # merely resembles a word character.
+    if prev in _JSON_ESCAPE_TAIL_CHARS and pos >= 2 and text[pos - 2] == "\\":
+        return True
+    # \uXXXX — a 6-character unicode escape whose last hex digit merely
+    # resembles a word character.
+    if pos >= 6 and text[pos - 6:pos - 4] == "\\u" and all(c in _HEX_DIGITS for c in text[pos - 4:pos]):
+        return True
+    return False
+
+
+def find_bounded_matches(text: str, needle: str, windows: bool, escape_aware: bool) -> list:
+    """Every occurrence of `needle` in `text` with a genuine boundary on
+    both sides. `escape_aware` must be True when `text` is raw (still
+    JSON-escaped) content and False when it's an already-parsed logical
+    string — see the module-level note above for why that distinction
+    matters. Returns a list of (start, end) spans, in order, non-overlapping."""
+    if not needle:
+        return []
+    flags = re.IGNORECASE if windows else 0
+    pattern = re.compile(re.escape(needle), flags)
+    spans = []
+    pos = 0
+    while True:
+        m = pattern.search(text, pos)
+        if not m:
+            break
+        start, end = m.start(), m.end()
+        if _boundary_ok_before(text, start, escape_aware) and _boundary_ok_after(text, end):
+            spans.append((start, end))
+            pos = end
+        else:
+            pos = start + 1
+    return spans
+
+
+def count_logical_matches(text: str, variants: list, windows: bool) -> int:
+    total = 0
+    for v in variants:
+        total += len(find_bounded_matches(text, v.old, windows, escape_aware=False))
+    return total
+
+
+def walk_json_strings(obj):
+    """Yield every string that appears as a dict key or a (nested) value."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str):
+                yield k
+            yield from walk_json_strings(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from walk_json_strings(item)
+    elif isinstance(obj, str):
+        yield obj
+
+
+@dataclass
+class EditResult:
+    new_text: str
+    changed: bool
+    counts: dict = field(default_factory=dict)
+    ambiguous: bool = False
+    note: str = ""
+
+
+def _replace_unit(text: str, variants: list, windows: bool, json_like: bool, structural: bool) -> EditResult:
+    expected = None
+    if structural:
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            data = None
+        if data is not None:
+            expected = sum(
+                count_logical_matches(s, variants, windows)
+                for s in walk_json_strings(data)
+            )
+
+    raw_variants = []
+    seen_raw = set()
+    # When json_like, also try the *unescaped* form as a fallback: a
+    # well-formed JSON file will never contain a bare single backslash
+    # (invalid outside an escape sequence), so this is a no-op there — but it
+    # lets a malformed/partially-written JSON file still be matched instead
+    # of silently skipped.
+    modes = [json_like, not json_like] if json_like else [json_like]
+    for mode in modes:
+        for v in variants:
+            raw_old = _to_raw_form(v.old, mode)
+            raw_new = _to_raw_form(v.new, mode)
+            if raw_old in seen_raw:
+                continue
+            seen_raw.add(raw_old)
+            raw_variants.append((v.label, raw_old, raw_new))
+
+    # Longest-old-first so a shorter variant can't shadow part of a longer one.
+    raw_variants.sort(key=lambda t: len(t[1]), reverse=True)
+
+    counts = {label: 0 for label, _, _ in raw_variants}
+
+    # Every variant's occurrences, found via the same canonical matcher used
+    # for the structural count above (escape_aware=json_like, since `text`
+    # here is the raw — still JSON-escaped, when json_like — file content).
+    candidates = []  # (start, end, label, new)
+    for label, old, new in raw_variants:
+        for start, end in find_bounded_matches(text, old, windows, escape_aware=json_like):
+            candidates.append((start, end, label, new))
+
+    # Leftmost match wins; at an equal start, prefer the longer span so a
+    # shorter variant can't shadow part of a longer one.
+    candidates.sort(key=lambda t: (t[0], -(t[1] - t[0])))
+
+    out = []
+    pos = 0
+    for start, end, label, new in candidates:
+        if start < pos:
+            continue  # overlaps a match already accepted from an earlier candidate
+        out.append(text[pos:start])
+        out.append(new)
+        counts[label] += 1
+        pos = end
+    out.append(text[pos:])
+    new_text = "".join(out)
+
+    total = sum(counts.values())
+    ambiguous = False
+    note = ""
+    if expected is not None and expected != total:
+        ambiguous = True
+        note = (
+            f"structural scan expected {expected} path reference(s) but the bounded "
+            f"text replace matched {total} — skipping this file for safety"
+        )
+        return EditResult(new_text=text, changed=False, counts=counts, ambiguous=True, note=note)
+
+    return EditResult(new_text=new_text, changed=total > 0, counts=counts, ambiguous=False, note="")
+
+
+def _raw_old_forms(variants: list, json_like: bool) -> list:
+    forms = []
+    seen = set()
+    modes = [True, False] if json_like else [False]
+    for mode in modes:
+        for v in variants:
+            f = _to_raw_form(v.old, mode)
+            if f not in seen:
+                seen.add(f)
+                forms.append(f)
+    return forms
+
+
+def count_case_sensitive_occurrences(text: str, variants: list, json_like: bool) -> int:
+    """Case-only renames make old_abs and new_abs case-insensitively
+    identical, so a normal (case-insensitive-on-Windows) staleness check
+    would always "find" the old path inside the correctly updated new-cased
+    content. This does a strictly case-sensitive check instead, so it only
+    flags genuine leftover old-cased text."""
+    total = 0
+    for form in _raw_old_forms(variants, json_like):
+        total += len(find_bounded_matches(text, form, windows=False, escape_aware=json_like))
+    return total
+
+
+def edit_text(raw_text: str, variants: list, windows: bool, json_like: bool, jsonl: bool) -> EditResult:
+    if not jsonl:
+        return _replace_unit(raw_text, variants, windows, json_like, structural=json_like)
+
+    lines = raw_text.splitlines(keepends=True)
+    out_lines = []
+    total_counts: dict = {}
+    any_changed = False
+    ambiguous_notes = []
+    for line in lines:
+        body = line.rstrip("\r\n")
+        eol = line[len(body):]
+        if body.strip() == "":
+            out_lines.append(line)
+            continue
+        result = _replace_unit(body, variants, windows, json_like=True, structural=True)
+        out_lines.append(result.new_text + eol)
+        if result.ambiguous:
+            ambiguous_notes.append(result.note)
+        elif result.changed:
+            any_changed = True
+        for k, v in result.counts.items():
+            total_counts[k] = total_counts.get(k, 0) + v
+
+    if ambiguous_notes:
+        return EditResult(
+            new_text=raw_text, changed=False, counts=total_counts, ambiguous=True,
+            note="; ".join(ambiguous_notes),
+        )
+    return EditResult(new_text="".join(out_lines), changed=any_changed, counts=total_counts)
+
+
+# --------------------------------------------------------------------------
+# Atomic, lossless file I/O
+# --------------------------------------------------------------------------
+
+def read_text_lossless(path: Path) -> str:
+    return path.read_bytes().decode("utf-8", errors="surrogateescape")
+
+
+def atomic_write_text(path: Path, text: str, validate_json: bool = False):
+    """Write via temp file + os.replace in the same directory (atomic on both
+    POSIX and Windows for same-volume replace). Never leaves a partially
+    written original: on any failure the temp file is removed and the
+    original is untouched."""
+    if validate_json:
+        json.loads(text)  # raises if invalid — caller decides how to handle
+
+    data = text.encode("utf-8", errors="surrogateescape")
+    parent = path.parent
+    fd, tmp_name = tempfile.mkstemp(dir=str(parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            shutil.copymode(str(path), tmp_name)
+        except OSError:
+            pass
+        os.replace(tmp_name, str(path))
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_name)
+        raise
+
+
+# --------------------------------------------------------------------------
+# Tree-conflict scanning for merges — full recursive scan, no partial merges.
+# --------------------------------------------------------------------------
+
+def scan_tree_conflicts(old_root: Path, new_root: Path, windows: bool) -> list:
+    """A conflict is ANY relative path that exists in both the source and
+    destination trees — including a directory that exists in both. Merge
+    mode requires the two trees to be completely disjoint; this tool
+    deliberately does not attempt a recursive, file-by-file merge of two
+    directories that share a subdirectory name, since the resulting content
+    of that shared directory (whose files may differ) is not something this
+    tool can complete safely without either overwriting or partially
+    stranding data. Returns a sorted list of conflicting relative path
+    strings. Empty list == safe to merge (source and destination are fully
+    disjoint at every level)."""
+    conflicts = []
+    if not old_root.is_dir():
+        return conflicts
+
+    def rel_key(p: str) -> str:
+        return p.lower() if windows else p
+
+    dest_keys = set()
+    if new_root.is_dir():
+        for p in new_root.rglob("*"):
+            dest_keys.add(rel_key(str(p.relative_to(new_root))))
+
+    for p in old_root.rglob("*"):
+        rel = str(p.relative_to(old_root))
+        if rel_key(rel) in dest_keys:
+            conflicts.append(rel)
+
+    return sorted(set(conflicts))
+
+
+def move_tree_disjoint(old_root: Path, new_root: Path):
+    """Move every entry from old_root into new_root. Caller must have already
+    verified scan_tree_conflicts() is empty."""
+    new_root.mkdir(parents=True, exist_ok=True)
+    # Move only the top-level children; shutil.move handles their subtrees.
+    for item in sorted(old_root.iterdir()):
+        dest = new_root / item.name
+        if dest.exists():
+            raise FileExistsError(f"unexpected conflict at {dest} during merge")
+        shutil.move(str(item), str(dest))
+    remaining = list(old_root.iterdir())
+    if remaining:
+        raise OSError(f"source directory not empty after merge: {old_root} still contains {len(remaining)} item(s)")
+    old_root.rmdir()
+
+
+# --------------------------------------------------------------------------
+# ProjectMover
+# --------------------------------------------------------------------------
 
 class ProjectMover:
-    def __init__(self, old_path: str, new_path: str, execute: bool = False, backup: bool = True, context_only: bool = False):
+    def __init__(
+        self,
+        old_path: str,
+        new_path: str,
+        execute: bool = False,
+        backup: bool = True,
+        context_only: bool = False,
+        env: ClaudeEnv | None = None,
+    ):
+        self.env = env or ClaudeEnv.default()
+        self.windows = self.env.windows
         self.context_only = context_only
+        self.home = str(self.env.home)
 
         if context_only:
-            # In context-only mode, old dir no longer exists — must use absolute paths
             self.old_abs = str(Path(old_path).expanduser()) if old_path.startswith("~") else old_path
             if not os.path.isabs(self.old_abs):
                 self.old_abs = str(Path.cwd() / self.old_abs)
-            self.new_abs = resolve_absolute(new_path)
+            self.new_abs = self._resolve_new(new_path)
         else:
-            self.old_abs = resolve_absolute(old_path)
-            self.new_abs = resolve_absolute(new_path) if os.path.isabs(new_path) or new_path.startswith("~") else str(Path(new_path).resolve())
-            # For new paths that don't exist yet, resolve relative to cwd
-            if not Path(self.new_abs).exists() and not os.path.isabs(new_path) and not new_path.startswith("~"):
-                self.new_abs = str(Path.cwd() / new_path)
+            self.old_abs = self._resolve_existing(old_path)
+            self.new_abs = self._resolve_new(new_path)
 
-        self.old_tilde = tilde_form(self.old_abs)
-        self.new_tilde = tilde_form(self.new_abs)
-        self.old_encoded = encode_path(self.old_abs)
-        self.new_encoded = encode_path(self.new_abs)
+        self.old_tilde = tilde_form(self.old_abs, self.home)
+        self.new_tilde = tilde_form(self.new_abs, self.home)
+        self.old_encoded = encode_path(self.old_abs, self.windows)
+        self.new_encoded = encode_path(self.new_abs, self.windows)
         self.execute = execute
-        self.backup = backup
-        self.actions: list[dict] = []
-        self.warnings: list[str] = []
+        self.backup_requested = backup
+        self.backup_effective = backup
+        self.actions: list = []
+        self.warnings: list = []
+        self.notes: list = []
+        self.errors: list = []
+        self.merge_conflicts: list = []
+        self.needs_merge = False
+        self.case_only_rename = False
+        self.relationship = "unrelated"
+        self.root_mirror_detected = False
+        self.mutated = False  # True only once an actual rename/merge/write/copy succeeds
+        self.backup_created = False  # a safety backup existing does NOT imply mutated
+        self._replacement_plans: dict = {}
+        self._plan_meta: dict = {}  # path -> (json_like, jsonl), for verification
+        self._plan_hashes: dict = {}  # path -> sha256 of original bytes at scan time
+
+    def _resolve_existing(self, path: str) -> str:
+        return str(Path(path).expanduser().resolve())
+
+    def _resolve_new(self, path: str) -> str:
+        p = Path(path).expanduser()
+        if p.is_absolute():
+            return str(Path(os.path.normpath(str(p))))
+        return str(Path(os.path.normpath(str(Path.cwd() / p))))
 
     def log_action(self, category: str, description: str, details: str = ""):
         self.actions.append({"category": category, "description": description, "details": details})
@@ -95,389 +652,266 @@ class ProjectMover:
     def warn(self, msg: str):
         self.warnings.append(msg)
 
+    def note(self, msg: str):
+        """Informational-only message — shown to the user but does not
+        downgrade the exit code (unlike warn(), which flags a genuine
+        correctness concern)."""
+        self.notes.append(msg)
+
+    def error(self, msg: str):
+        self.errors.append(msg)
+
+    # ---------------------------------------------------------------- preflight
+
     def preflight(self) -> bool:
-        """Run preflight checks. Returns False if move should be aborted."""
         ok = True
+        self.relationship = classify_relationship(Path(self.old_abs), Path(self.new_abs), self.windows)
+
+        if self.relationship == "same":
+            print(f"ERROR: Source and destination are the same path: {self.old_abs}")
+            return False
+
+        if self.relationship == "dest-inside-src":
+            print("ERROR: Destination is inside the source directory — cannot move a directory into its own subtree.")
+            print(f"  Source:      {self.old_abs}")
+            print(f"  Destination: {self.new_abs}")
+            return False
+
+        if self.relationship == "src-inside-dest" and not self.context_only:
+            print("ERROR: Destination is an existing ancestor of the source directory.")
+            print(f"  Source:      {self.old_abs}")
+            print(f"  Destination: {self.new_abs}")
+            print("  Refusing to merge a directory into its own ancestor.")
+            return False
+
+        self.case_only_rename = self.relationship == "case-only"
 
         if self.context_only:
-            # In context-only mode, old dir is gone, new dir must exist
             if Path(self.old_abs).is_dir():
                 self.warn("Source directory still exists — are you sure you need --context-only?")
             if not Path(self.new_abs).is_dir():
                 print(f"ERROR: New directory does not exist: {self.new_abs}")
-                print(f"  --context-only expects the directory to already be at the new location.")
+                print("  --context-only expects the directory to already be at the new location.")
                 ok = False
         else:
-            # Normal mode: old dir must exist, new dir must NOT exist
             if not Path(self.old_abs).is_dir():
                 print(f"ERROR: Source directory does not exist: {self.old_abs}")
                 ok = False
 
-            if Path(self.new_abs).exists():
-                if self.execute:
-                    ok = self._handle_destination_conflict()
-                else:
-                    print(f"ERROR: Destination already exists: {self.new_abs}")
-                    print(f"  Use --execute to get interactive merge/clean/abort options.")
+            dest_exists = Path(self.new_abs).exists() and not self.case_only_rename
+            if dest_exists:
+                conflicts = scan_tree_conflicts(Path(self.old_abs), Path(self.new_abs), self.windows)
+                for subdir in PATH_ENCODED_DIRS:
+                    old_enc = self.env.claude_dir / subdir / self.old_encoded
+                    new_enc = self.env.claude_dir / subdir / self.new_encoded
+                    if new_enc.exists():
+                        conflicts.extend(
+                            f"[claude-state:{subdir}] {c}"
+                            for c in scan_tree_conflicts(old_enc, new_enc, self.windows)
+                        )
+                self.merge_conflicts = conflicts
+                if conflicts:
+                    print(f"ERROR: Destination already exists and has {len(conflicts)} conflicting item(s):")
+                    for c in conflicts[:20]:
+                        print(f"  ! {c}")
+                    if len(conflicts) > 20:
+                        print(f"  ... and {len(conflicts) - 20} more")
+                    print("  Refusing to merge — resolve conflicts manually or choose a different destination.")
                     ok = False
+                else:
+                    self.needs_merge = True
+                    if not self.execute:
+                        print(f"NOTE: Destination already exists but has no conflicting files — a safe merge is possible.")
 
-            # Destination parent must exist
             new_parent = Path(self.new_abs).parent
             if not new_parent.is_dir():
                 print(f"ERROR: Destination parent does not exist: {new_parent}")
                 ok = False
 
-        # Prefix overlap check
-        if check_prefix_overlap(self.old_abs, self.new_abs):
-            print(f"ERROR: Prefix overlap detected!")
-            print(f"  Old: {self.old_abs}")
-            print(f"  New: {self.new_abs}")
-            print(f"  A sed replacement of '{self.old_abs}' would also match '{self.new_abs}',")
-            print(f"  causing double-substitution. Use bounded sed or a different path structure.")
-            ok = False
-
-        if check_prefix_overlap(self.old_tilde, self.new_tilde):
-            # Only warn if the absolute check didn't already catch it
-            if not check_prefix_overlap(self.old_abs, self.new_abs):
-                print(f"WARNING: Tilde-form prefix overlap: {self.old_tilde} → {self.new_tilde}")
-                self.warn("Tilde-form prefix overlap — will use bounded replacements")
-
         return ok
 
-    def _handle_destination_conflict(self) -> bool:
-        """Interactive prompt when destination directory already exists."""
-        print(f"\nDestination already exists: {self.new_abs}")
+    # ---------------------------------------------------------------- scanning
 
-        # Check for Claude context at destination
-        dest_sessions = 0
-        dest_context_dir = CLAUDE_DIR / "projects" / self.new_encoded
-        if dest_context_dir.exists():
-            dest_sessions = len(list(dest_context_dir.glob("*.jsonl")))
-
-        if dest_sessions > 0:
-            print(f"  Claude context exists at destination ({dest_sessions} sessions)")
-
-        print(f"\n  Options:")
-        print(f"    [c] Clean — delete destination dir + its Claude context, then move")
-        print(f"    [m] Merge — move source files into destination, merge Claude context")
-        print(f"    [n] Abort (default)")
-        print()
-
-        try:
-            choice = input("  Choose [c/m/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Aborted.")
-            return False
-
-        if choice == "c":
-            print(f"  Cleaning destination...")
-            shutil.rmtree(self.new_abs)
-            # Clean destination Claude context too
-            for subdir in PATH_ENCODED_DIRS:
-                dest_path = CLAUDE_DIR / subdir / self.new_encoded
-                if dest_path.exists():
-                    shutil.rmtree(dest_path)
-            print(f"  Cleaned. Proceeding with move.")
-            return True
-        elif choice == "m":
-            self._merge_mode = True
-            print(f"  Will merge into existing destination.")
-            return True
-        else:
-            print(f"  Aborted.")
-            return False
+    def _variants(self) -> list:
+        return build_logical_variants(self.old_abs, self.new_abs, self.home, self.windows)
 
     def scan_encoded_dirs(self):
-        """Items 1-5: Find path-encoded directories that need renaming."""
         for subdir in PATH_ENCODED_DIRS:
-            old_path = CLAUDE_DIR / subdir / self.old_encoded
+            old_path = self.env.claude_dir / subdir / self.old_encoded
             if old_path.exists():
-                new_path = CLAUDE_DIR / subdir / self.new_encoded
-                conflict = " (MERGE — destination exists)" if new_path.exists() else ""
+                new_path = self.env.claude_dir / subdir / self.new_encoded
+                conflict = " (MERGE — destination exists, verified conflict-free)" if new_path.exists() else ""
                 self.log_action(
                     f"encoded-dir/{subdir}",
-                    f"Rename {subdir}/{self.old_encoded} → {subdir}/{self.new_encoded}{conflict}",
+                    f"Rename {subdir}/{self.old_encoded} -> {subdir}/{self.new_encoded}{conflict}",
                     str(old_path),
                 )
 
-    def scan_session_files(self):
-        """Item 6: Find session .jsonl files that contain the old path."""
-        projects_dir = CLAUDE_DIR / "projects" / self.new_encoded
-        # After rename, files will be in new_encoded dir. During dry-run, check old_encoded.
-        check_dir = CLAUDE_DIR / "projects" / self.old_encoded
-        if not check_dir.exists():
+    def scan_root_mirror(self):
+        """Some Claude Code versions/installs have been observed to also keep
+        a path-encoded directory directly under ~/.claude/ (outside
+        projects/). We only detect and back it up — we never rename or
+        otherwise modify it, since its purpose/lifecycle isn't documented."""
+        mirror = self.env.claude_dir / self.old_encoded
+        if mirror.is_dir() and mirror != (self.env.claude_dir / "projects" / self.old_encoded):
+            self.root_mirror_detected = True
+            self.log_action(
+                "root-mirror-detected",
+                f"Detected undocumented state directory ~/.claude/{self.old_encoded} — NOT modified by this tool",
+                "This directory will be backed up for safety but left in place. Verify its purpose before touching it manually.",
+            )
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+    def _record_plan(self, path: Path, original_raw: str, result: "EditResult", json_like: bool, jsonl: bool):
+        self._replacement_plans[str(path)] = result
+        self._plan_meta[str(path)] = (json_like, jsonl)
+        self._plan_hashes[str(path)] = self._hash_text(original_raw)
+
+    def _scan_text_file(self, path: Path, category: str, json_like: bool, jsonl: bool, label: str):
+        if not path.exists():
+            return
+        try:
+            raw = read_text_lossless(path)
+        except OSError as e:
+            self.error(f"Could not read {path}: {e}")
             return
 
+        result = edit_text(raw, self._variants(), self.windows, json_like=json_like, jsonl=jsonl)
+        if result.ambiguous:
+            self.warn(f"{label}: {result.note}")
+            return
+        total = sum(result.counts.values())
+        if total > 0:
+            per_variant = ", ".join(f"{k}={v}" for k, v in result.counts.items() if v)
+            self.log_action(category, f"Update {total} reference(s) in {label}", f"By form: {per_variant}")
+        self._record_plan(path, raw, result, json_like, jsonl)
+
+    def scan_session_files(self):
+        check_dir = self.env.claude_dir / "projects" / self.old_encoded
+        if not check_dir.exists():
+            return
         count = 0
-        for jsonl in check_dir.glob("*.jsonl"):
+        total_refs = 0
+        for jsonl in sorted(check_dir.glob("*.jsonl")):
             try:
-                content = jsonl.read_text(errors="replace")
-                if self.old_abs in content:
-                    count += 1
-            except Exception:
-                pass
+                raw = read_text_lossless(jsonl)
+            except OSError as e:
+                self.error(f"Could not read session file {jsonl}: {e}")
+                continue
+            result = edit_text(raw, self._variants(), self.windows, json_like=True, jsonl=True)
+            if result.ambiguous:
+                self.warn(f"session file {jsonl.name}: {result.note}")
+                continue
+            total = sum(result.counts.values())
+            if total > 0:
+                count += 1
+                total_refs += total
+            self._record_plan(jsonl, raw, result, json_like=True, jsonl=True)
 
         if count > 0:
             self.log_action(
                 "session-content",
-                f"Update {count} session .jsonl file(s) — replace path strings inside transcripts",
-                f"Replace: {self.old_abs} → {self.new_abs}",
+                f"Update {count} session .jsonl file(s) — {total_refs} path reference(s) total",
+                f"In: {check_dir}",
             )
 
     def scan_history(self):
-        """Item 7: Check history.jsonl for old path references."""
-        if not HISTORY_FILE.exists():
-            return
-
-        count = 0
-        try:
-            for line in HISTORY_FILE.read_text(errors="replace").splitlines():
-                if self.old_abs in line:
-                    count += 1
-        except Exception:
-            pass
-
-        if count > 0:
-            self.log_action(
-                "history.jsonl",
-                f"Update {count} line(s) in history.jsonl",
-                f"Replace: {self.old_abs} → {self.new_abs}",
-            )
+        self._scan_text_file(self.env.history_file, "history.jsonl", json_like=True, jsonl=True, label="history.jsonl")
 
     def scan_claude_json(self):
-        """Item 8: Check ~/.claude.json for permission entries keyed to old path."""
-        if not CLAUDE_JSON.exists():
-            return
-
-        try:
-            content = CLAUDE_JSON.read_text()
-            # Count occurrences of old path in the JSON
-            abs_count = content.count(self.old_abs)
-            tilde_count = content.count(self.old_tilde)
-            total = abs_count + tilde_count
-
-            if total > 0:
-                self.log_action(
-                    "claude.json",
-                    f"Update {total} reference(s) in ~/.claude.json ({abs_count} absolute, {tilde_count} tilde)",
-                    "Permission entries and project keys",
-                )
-        except Exception:
-            pass
+        self._scan_text_file(self.env.claude_json, "claude.json", json_like=True, jsonl=False, label="~/.claude.json")
 
     def scan_plugins(self):
-        """Item 9: Check installed_plugins.json for projectPath entries."""
-        if not PLUGINS_FILE.exists():
-            return
-
-        try:
-            data = json.loads(PLUGINS_FILE.read_text())
-            count = 0
-            plugins = data.get("plugins", {}) if isinstance(data, dict) else {}
-            for name, entries in plugins.items():
-                if isinstance(entries, list):
-                    for entry in entries:
-                        pp = entry.get("projectPath", "")
-                        if self.old_abs in pp or self.old_tilde in pp:
-                            count += 1
-
-            if count > 0:
-                self.log_action(
-                    "plugins",
-                    f"Update {count} projectPath entry/entries in installed_plugins.json",
-                    f"Replace: {self.old_abs} → {self.new_abs}",
-                )
-        except Exception:
-            pass
+        self._scan_text_file(
+            self.env.plugins_file, "plugins", json_like=True, jsonl=False, label="installed_plugins.json"
+        )
 
     def scan_project_settings(self):
-        """Item 10: Check the project's own settings.local.json."""
         settings_file = Path(self.old_abs) / ".claude" / "settings.local.json"
-        if not settings_file.exists():
+        self._scan_text_file(
+            settings_file, "own-settings", json_like=True, jsonl=False,
+            label="project's own settings.local.json",
+        )
+
+    def _iter_other_settings_files(self):
+        developer_dir = Path(self.old_abs).parent
+        if paths_equal(developer_dir, Path(self.home), self.windows) or str(developer_dir) == developer_dir.anchor:
             return
-
+        if not developer_dir.exists():
+            return
         try:
-            content = settings_file.read_text()
-            abs_count = content.count(self.old_abs)
-            tilde_count = content.count(self.old_tilde)
-            total = abs_count + tilde_count
-
-            if total > 0:
-                self.log_action(
-                    "own-settings",
-                    f"Update {total} reference(s) in project's own settings.local.json",
-                    str(settings_file),
-                )
-        except Exception:
-            pass
+            candidates = list(developer_dir.rglob(".claude/settings.local.json"))
+        except OSError as e:
+            self.error(f"Could not scan {developer_dir} for cross-project settings: {e}")
+            return
+        for settings_file in candidates:
+            if is_ancestor(Path(self.old_abs), settings_file, self.windows):
+                continue
+            yield settings_file
 
     def scan_cross_project_settings(self):
-        """Item 11: Check other projects' settings.local.json for cross-references."""
-        developer_dir = Path(self.old_abs).parent
-        # Safety: don't rglob above the project's parent (avoids traversing all of ~/)
-        if developer_dir == Path(HOME) or developer_dir == Path("/"):
-            return
-
         found = []
-        for settings_file in developer_dir.rglob(".claude/settings.local.json"):
-            # Skip the project being moved
-            if str(settings_file).startswith(self.old_abs):
-                continue
+        for settings_file in self._iter_other_settings_files():
             try:
-                content = settings_file.read_text()
-                if self.old_abs in content or self.old_tilde in content:
-                    rel = str(settings_file.relative_to(developer_dir))
-                    found.append(rel)
-            except Exception:
-                pass
+                raw = read_text_lossless(settings_file)
+            except OSError as e:
+                self.error(f"Could not read {settings_file}: {e}")
+                continue
+            result = edit_text(raw, self._variants(), self.windows, json_like=True, jsonl=False)
+            if result.ambiguous:
+                self.warn(f"{settings_file}: {result.note}")
+                continue
+            if sum(result.counts.values()) > 0:
+                found.append(settings_file)
+                self._record_plan(settings_file, raw, result, json_like=True, jsonl=False)
 
         if found:
+            rel_list = []
+            for f in found:
+                try:
+                    rel_list.append(str(f.relative_to(Path(self.old_abs).parent)))
+                except ValueError:
+                    rel_list.append(str(f))
             self.log_action(
                 "cross-project-settings",
                 f"Update {len(found)} other project(s)' settings.local.json with cross-references",
-                "\n".join(f"  - {f}" for f in found),
+                "\n".join(f"  - {r}" for r in rel_list),
             )
 
     def scan_memory_files(self):
-        """Item 12: Check memory files for path references."""
-        memory_base = CLAUDE_DIR / "projects"
+        memory_base = self.env.claude_dir / "projects"
         if not memory_base.exists():
             return
-
         found = []
-        for md_file in memory_base.rglob("memory/*.md"):
+        try:
+            candidates = list(memory_base.rglob("memory/*.md"))
+        except OSError as e:
+            self.error(f"Could not scan {memory_base} for memory files: {e}")
+            candidates = []
+        for md_file in candidates:
             try:
-                content = md_file.read_text()
-                if self.old_abs in content or self.old_tilde in content:
-                    found.append(str(md_file.relative_to(CLAUDE_DIR)))
-            except Exception:
-                pass
+                raw = read_text_lossless(md_file)
+            except OSError as e:
+                self.error(f"Could not read {md_file}: {e}")
+                continue
+            result = edit_text(raw, self._variants(), self.windows, json_like=False, jsonl=False)
+            if sum(result.counts.values()) > 0:
+                found.append(md_file)
+                self._record_plan(md_file, raw, result, json_like=False, jsonl=False)
 
         if found:
             self.log_action(
                 "memory-files",
                 f"Update {len(found)} memory file(s) with path references",
-                "\n".join(f"  - {f}" for f in found),
+                "\n".join(f"  - {f.relative_to(self.env.claude_dir)}" for f in found),
             )
 
-    def create_backup(self) -> Path | None:
-        """Create timestamped backup of all files that will be modified. Returns backup dir path."""
-        if not self.actions:
-            return None
-
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_dir = CLAUDE_DIR / "backups" / f"project-move-{timestamp}"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-
-        manifest = []
-
-        # Back up files that execute methods will modify
-        files_to_backup = []
-
-        # history.jsonl
-        if HISTORY_FILE.exists():
-            files_to_backup.append(HISTORY_FILE)
-
-        # ~/.claude.json
-        if CLAUDE_JSON.exists():
-            files_to_backup.append(CLAUDE_JSON)
-
-        # installed_plugins.json
-        if PLUGINS_FILE.exists():
-            files_to_backup.append(PLUGINS_FILE)
-
-        # Project's own settings.local.json
-        own_settings = Path(self.old_abs) / ".claude" / "settings.local.json"
-        if own_settings.exists():
-            files_to_backup.append(own_settings)
-
-        # Cross-project settings.local.json files
-        developer_dir = Path(self.old_abs).parent
-        if developer_dir != Path(HOME) and developer_dir != Path("/") and developer_dir.exists():
-            for sf in developer_dir.rglob(".claude/settings.local.json"):
-                if not str(sf).startswith(self.old_abs):
-                    try:
-                        content = sf.read_text()
-                        if self.old_abs in content or self.old_tilde in content:
-                            files_to_backup.append(sf)
-                    except Exception:
-                        pass
-
-        # Memory files
-        memory_base = CLAUDE_DIR / "projects"
-        if memory_base.exists():
-            for md_file in memory_base.rglob("memory/*.md"):
-                try:
-                    content = md_file.read_text()
-                    if self.old_abs in content or self.old_tilde in content:
-                        files_to_backup.append(md_file)
-                except Exception:
-                    pass
-
-        for f in files_to_backup:
-            rel = str(f).replace(HOME + "/", "")
-            dest = backup_dir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(f, dest)
-            manifest.append(rel)
-
-        # Write manifest
-        (backup_dir / "MANIFEST.txt").write_text(
-            f"project-move backup — {timestamp}\n"
-            f"Move: {self.old_abs} → {self.new_abs}\n\n"
-            f"Files backed up ({len(manifest)}):\n"
-            + "\n".join(f"  {f}" for f in manifest)
-            + "\n\nTo restore: cp -f <backup_file> ~/<original_path>\n"
-        )
-
-        return backup_dir
-
-    def verify_move(self) -> list[str]:
-        """Post-move verification: re-scan for any remaining stale references."""
-        stale = []
-
-        # Check history.jsonl
-        if HISTORY_FILE.exists():
-            content = HISTORY_FILE.read_text(errors="replace")
-            count = content.count(self.old_abs)
-            if count > 0:
-                stale.append(f"history.jsonl: {count} stale reference(s)")
-
-        # Check ~/.claude.json
-        if CLAUDE_JSON.exists():
-            content = CLAUDE_JSON.read_text()
-            count = content.count(self.old_abs) + content.count(self.old_tilde)
-            if count > 0:
-                stale.append(f"~/.claude.json: {count} stale reference(s)")
-
-        # Check plugins
-        if PLUGINS_FILE.exists():
-            content = PLUGINS_FILE.read_text()
-            count = content.count(self.old_abs) + content.count(self.old_tilde)
-            if count > 0:
-                stale.append(f"installed_plugins.json: {count} stale reference(s)")
-
-        # Check session files in new location
-        session_dir = CLAUDE_DIR / "projects" / self.new_encoded
-        if session_dir.exists():
-            for jsonl in session_dir.glob("*.jsonl"):
-                try:
-                    if self.old_abs in jsonl.read_text(errors="replace"):
-                        stale.append(f"session file: {jsonl.name}")
-                except Exception:
-                    pass
-
-        # Check old encoded dirs still exist (shouldn't after move)
-        for subdir in PATH_ENCODED_DIRS:
-            old_path = CLAUDE_DIR / subdir / self.old_encoded
-            if old_path.exists():
-                stale.append(f"old encoded dir still exists: {subdir}/{self.old_encoded}")
-
-        return stale
-
     def scan_all(self):
-        """Run all scans."""
         self.scan_encoded_dirs()
+        self.scan_root_mirror()
         self.scan_session_files()
         self.scan_history()
         self.scan_claude_json()
@@ -486,225 +920,587 @@ class ProjectMover:
         self.scan_cross_project_settings()
         self.scan_memory_files()
 
-    def execute_encoded_dirs(self):
-        """Execute items 1-5: Rename path-encoded directories."""
-        for subdir in PATH_ENCODED_DIRS:
-            old_path = CLAUDE_DIR / subdir / self.old_encoded
-            new_path = CLAUDE_DIR / subdir / self.new_encoded
+    # ---------------------------------------------------------------- backup
 
+    def create_backup(self) -> Path | None:
+        """Back up every file/directory this run could modify, before any
+        write happens. Returns the backup directory, or None if there was
+        nothing to back up. Raises on failure — callers must treat a raised
+        exception as a hard abort (no destructive step may follow)."""
+        files_to_backup = list(self._replacement_plans.keys())
+        dirs_to_backup = []
+
+        for subdir in PATH_ENCODED_DIRS:
+            p = self.env.claude_dir / subdir / self.old_encoded
+            if p.exists():
+                dirs_to_backup.append((p, f"{subdir}/{self.old_encoded}"))
+
+        if self.root_mirror_detected:
+            dirs_to_backup.append((self.env.claude_dir / self.old_encoded, f"{self.old_encoded} (root mirror)"))
+
+        if not files_to_backup and not dirs_to_backup:
+            return None
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_dir = self.env.claude_dir / "backups" / f"project-move-{timestamp}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest_lines = [
+            f"project-move backup — {timestamp}",
+            f"Move: {self.old_abs} -> {self.new_abs}",
+            "",
+        ]
+
+        manifest_lines.append(f"Files backed up ({len(files_to_backup)}):")
+        for f in files_to_backup:
+            src = Path(f)
+            rel = self._safe_rel(src)
+            dest = backup_dir / "files" / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            manifest_lines.append(f"  {src}  ->  restore: copy '{dest}' back to '{src}'")
+
+        manifest_lines.append("")
+        manifest_lines.append(f"Directories backed up ({len(dirs_to_backup)}):")
+        for src_dir, label in dirs_to_backup:
+            dest_dir = backup_dir / "dirs" / label
+            dest_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src_dir, dest_dir)
+            manifest_lines.append(f"  {src_dir}  ->  restore: copy '{dest_dir}' back to '{src_dir}'")
+
+        manifest_lines.append("")
+        manifest_lines.append("To roll back the directory move itself:")
+        manifest_lines.append(f"  If '{self.new_abs}' exists and '{self.old_abs}' does not, move it back.")
+        manifest_lines.append("  (The directory move is the last irreversible step; if it never completed,")
+        manifest_lines.append("   the original directory is untouched and there is nothing to restore there.)")
+
+        (backup_dir / "MANIFEST.txt").write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
+        return backup_dir
+
+    def _safe_rel(self, path: Path) -> Path:
+        """Turn an absolute path into a relative one safe to nest under the
+        backup directory on any platform (strips the drive/UNC anchor or the
+        POSIX root so we never accidentally join an absolute path — which
+        would silently discard the backup directory prefix)."""
+        p = PurePath(str(path))
+        parts = p.parts
+        if p.root:
+            parts = parts[1:]
+        cleaned_drive = re.sub(r"[^A-Za-z0-9_.-]", "_", p.drive.rstrip(":\\/")) if p.drive else ""
+        if cleaned_drive:
+            return Path(cleaned_drive, *parts)
+        return Path(*parts) if parts else Path(p.name)
+
+    # ---------------------------------------------------------------- execute
+
+    def _remap_after_encoded_dir_rename(self, path: Path) -> Path:
+        """Where a scan-time path now lives once execute_encoded_dirs() has
+        possibly renamed/merged the containing projects/<old_encoded> tree
+        (session/memory files live there). Used at write time (step 3),
+        which runs after the encoded-dir rename (step 2) but before the
+        project directory itself moves (step 4)."""
+        if path.exists():
+            return path
+        old_root = self.env.claude_dir / "projects" / self.old_encoded
+        new_root = self.env.claude_dir / "projects" / self.new_encoded
+        try:
+            rel = path.relative_to(old_root)
+        except ValueError:
+            return path
+        candidate = new_root / rel
+        return candidate if candidate.exists() else path
+
+    def _remap_after_full_move(self, path: Path) -> Path:
+        """Where a scan-time path now lives once the ENTIRE move has
+        completed: the encoded-dir rename and the project directory
+        move/merge/rename itself (files under the project's own directory,
+        e.g. its .claude/settings.local.json, move with the directory in
+        step 4). Used at verification time (step 5)."""
+        path = self._remap_after_encoded_dir_rename(path)
+        if path.exists() or self.context_only:
+            return path
+        try:
+            rel = path.relative_to(Path(self.old_abs))
+        except ValueError:
+            return path
+        candidate = Path(self.new_abs) / rel
+        return candidate if candidate.exists() else path
+
+    def _check_hash_unchanged(self, path: Path, path_str: str) -> bool:
+        """True if `path` still matches the hash captured at scan time (or
+        there's nothing to compare). Records an error and returns False on a
+        read failure or a mismatch — never raises."""
+        expected_hash = self._plan_hashes.get(path_str)
+        if expected_hash is None:
+            return True
+        try:
+            current_raw = read_text_lossless(path)
+        except OSError as e:
+            self.error(f"Failed to re-read {path} before writing: {e}")
+            return False
+        if self._hash_text(current_raw) != expected_hash:
+            self.error(
+                f"{path} changed after scanning (by Claude Code or another process) — "
+                f"not overwriting it. Close Claude Code and re-run project-move from scratch."
+            )
+            return False
+        return True
+
+    def _write_planned_files(self):
+        """Write every scanned file that had genuine changes, in two passes:
+
+        1. Prevalidate: every changed item must still exist at its expected
+           (remapped) location and match the hash captured at scan time. ALL
+           items are checked — every problem is collected and reported — but
+           if ANY item fails, NOTHING is written: we return before the write
+           pass starts.
+        2. Write: only reached if every item passed prevalidation. Each file
+           gets one more immediate hash recheck right before it's written
+           (closing the race between prevalidation and the write itself). A
+           recheck failure or a write failure stops the loop immediately —
+           later planned files are never attempted, even ones that would
+           have passed on their own.
+        """
+        planned = [(p, r) for p, r in self._replacement_plans.items() if r.changed]
+
+        resolved = {}
+        for path_str, _result in planned:
+            path = self._remap_after_encoded_dir_rename(Path(path_str))
+            if not path.exists():
+                self.error(f"Failed to write {path_str}: file no longer exists at the expected location")
+                continue
+            if not self._check_hash_unchanged(path, path_str):
+                continue
+            resolved[path_str] = path
+
+        if self.errors:
+            return  # prevalidation found a problem — nothing gets written this run
+
+        for path_str, result in planned:
+            path = resolved[path_str]
+            if not self._check_hash_unchanged(path, path_str):
+                break
+            try:
+                is_json = path.suffix == ".json"
+                atomic_write_text(path, result.new_text, validate_json=is_json)
+                self.mutated = True
+            except Exception as e:
+                self.error(f"Failed to write {path}: {e}")
+                break
+
+    def execute_encoded_dirs(self):
+        for subdir in PATH_ENCODED_DIRS:
+            old_path = self.env.claude_dir / subdir / self.old_encoded
+            new_path = self.env.claude_dir / subdir / self.new_encoded
             if not old_path.exists():
                 continue
-
-            if new_path.exists():
-                # Merge: move all files from old to new
-                for item in old_path.iterdir():
-                    dest = new_path / item.name
-                    if not dest.exists():
-                        shutil.move(str(item), str(dest))
-                # Remove old dir if empty
+            if str(old_path) != str(new_path) and paths_equal(old_path, new_path, self.windows):
+                # Windows is case-insensitive: new_path.exists() would be True
+                # here purely because it's the same directory as old_path, not
+                # because of a genuine conflict. Handle it as the case/format
+                # -only rename it actually is.
                 try:
-                    old_path.rmdir()
-                except OSError:
-                    shutil.rmtree(old_path)
-            else:
-                old_path.rename(new_path)
-
-    def execute_session_content(self):
-        """Execute item 6: Update session file contents."""
-        session_dir = CLAUDE_DIR / "projects" / self.new_encoded
-        if not session_dir.exists():
-            return
-
-        for jsonl in session_dir.glob("*.jsonl"):
-            try:
-                content = jsonl.read_text(errors="replace")
-                if self.old_abs in content:
-                    updated = content.replace(self.old_abs, self.new_abs)
-                    jsonl.write_text(updated)
-            except Exception as e:
-                self.warn(f"Failed to update session file {jsonl.name}: {e}")
-
-    def execute_history(self):
-        """Execute item 7: Update history.jsonl."""
-        if not HISTORY_FILE.exists():
-            return
-
-        content = HISTORY_FILE.read_text(errors="replace")
-        # Use bounded replacement to avoid prefix issues
-        # Replace the exact quoted form first (most common in JSON)
-        updated = content.replace(f'"{self.old_abs}"', f'"{self.new_abs}"')
-        # Then any remaining unquoted references
-        if self.old_abs in updated:
-            updated = updated.replace(self.old_abs, self.new_abs)
-        HISTORY_FILE.write_text(updated)
-
-    def execute_claude_json(self):
-        """Execute item 8: Update ~/.claude.json permission entries."""
-        if not CLAUDE_JSON.exists():
-            return
-
-        content = CLAUDE_JSON.read_text()
-        updated = content.replace(self.old_abs, self.new_abs)
-        updated = updated.replace(self.old_tilde, self.new_tilde)
-        if updated != content:
-            CLAUDE_JSON.write_text(updated)
-
-    def execute_plugins(self):
-        """Execute item 9: Update installed_plugins.json."""
-        if not PLUGINS_FILE.exists():
-            return
-
-        content = PLUGINS_FILE.read_text()
-        # Use string replacement on the raw JSON to preserve formatting
-        updated = content.replace(self.old_abs, self.new_abs)
-        updated = updated.replace(self.old_tilde, self.new_tilde)
-        if updated != content:
-            # Validate JSON before writing
-            json.loads(updated)
-            PLUGINS_FILE.write_text(updated)
-
-    def execute_project_settings(self):
-        """Execute item 10: Update project's own settings.local.json."""
-        # After directory move, the file is at the new location
-        settings_file = Path(self.new_abs) / ".claude" / "settings.local.json"
-        if not settings_file.exists():
-            return
-
-        content = settings_file.read_text()
-        updated = content.replace(self.old_abs, self.new_abs)
-        updated = updated.replace(self.old_tilde, self.new_tilde)
-        if updated != content:
-            settings_file.write_text(updated)
-
-    def execute_cross_project_settings(self):
-        """Execute item 11: Update other projects' settings.local.json."""
-        developer_dir = Path(self.new_abs).parent
-        if developer_dir == Path(HOME) or developer_dir == Path("/"):
-            return
-
-        for settings_file in developer_dir.rglob(".claude/settings.local.json"):
-            if str(settings_file).startswith(self.new_abs):
+                    rename_case_only(old_path, new_path)
+                    self.mutated = True
+                except OSError as e:
+                    self.error(f"Failed to rename {subdir}/{self.old_encoded} (case-only): {e}")
                 continue
-            try:
-                content = settings_file.read_text()
-                updated = content.replace(self.old_abs, self.new_abs)
-                updated = updated.replace(self.old_tilde, self.new_tilde)
-                if updated != content:
-                    settings_file.write_text(updated)
-            except Exception as e:
-                self.warn(f"Failed to update {settings_file}: {e}")
+            if new_path.exists():
+                conflicts = scan_tree_conflicts(old_path, new_path, self.windows)
+                if conflicts:
+                    self.error(
+                        f"Refusing to merge {subdir}/{self.old_encoded}: "
+                        f"{len(conflicts)} conflict(s) appeared since preflight"
+                    )
+                    continue
+                try:
+                    move_tree_disjoint(old_path, new_path)
+                    self.mutated = True
+                except OSError as e:
+                    self.error(f"Failed to merge {subdir}/{self.old_encoded} into {self.new_encoded}: {e}")
+            else:
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                old_path.rename(new_path)
+                self.mutated = True
 
-    def execute_memory_files(self):
-        """Execute item 12: Update memory files."""
-        memory_base = CLAUDE_DIR / "projects"
-        if not memory_base.exists():
-            return
+    def _stop_stage(self, backup_dir, stage: str) -> int:
+        """Called when an execution-stage error is found. Whether ANY prior
+        stage actually mutated anything varies (e.g. the very first
+        encoded-dir rename attempted might be the one that failed, in which
+        case nothing has changed yet) — self.mutated reflects that precisely,
+        so the exit code is derived from it rather than assumed. We
+        deliberately do NOT attempt automatic rollback here: reliably undoing
+        a partially-completed encoded-dir rename/merge or a partial set of
+        file writes is not something we can guarantee without risking
+        further damage. Instead we stop before the next destructive stage (in
+        particular: never move/merge the project directory after a failed
+        state update), preserve both the source and destination exactly as
+        they are, and point at the backup so the user (or a follow-up run)
+        can recover deliberately."""
+        print()
+        print(f"STOPPED after an error during: {stage}")
+        print("No further stages were attempted — in particular, the project directory was NOT moved.")
+        if self.errors:
+            print(f"\nErrors ({len(self.errors)}):")
+            for e in self.errors:
+                print(f"  ! {e}")
+        if self.notes:
+            print(f"\nNotes ({len(self.notes)}):")
+            for n in self.notes:
+                print(f"  - {n}")
+        if backup_dir:
+            print(f"\nRecovery: every file/directory this run could touch was backed up before any write.")
+            print(f"  Backup: {backup_dir}")
+            print(f"  See {backup_dir / 'MANIFEST.txt'} for the original location of each item and how to restore it.")
+        else:
+            print("\nNo backup was created for this run — recovery may require manual inspection.")
+        print(f"\nSource directory (untouched by the project move itself): {self.old_abs}")
+        return EXIT_PARTIAL if self.mutated else EXIT_ABORTED
 
-        for md_file in memory_base.rglob("memory/*.md"):
-            try:
-                content = md_file.read_text()
-                updated = content.replace(self.old_abs, self.new_abs)
-                updated = updated.replace(self.old_tilde, self.new_tilde)
-                if updated != content:
-                    md_file.write_text(updated)
-            except Exception as e:
-                self.warn(f"Failed to update memory file {md_file}: {e}")
-
-    def execute_move(self):
-        """Execute the full move sequence with backup and verification."""
+    def execute_move(self, assume_yes: bool = False, confirm=None) -> int:
         print(f"\n{'='*60}")
-        print(f" EXECUTING MOVE")
+        print(" EXECUTING MOVE")
         print(f"{'='*60}\n")
 
-        # Step 1: Create backup of all files that will be modified
-        if self.backup:
-            print("[1/9] Creating backup...")
-            backup_dir = self.create_backup()
-            if backup_dir:
-                print(f"       Backup: {backup_dir}")
-            else:
-                print("       No files to back up.")
+        self.mutated = False
+
+        if self.errors:
+            print("ABORTED: preflight/scan reported errors — see above. No changes made.")
+            for e in self.errors:
+                print(f"  ! {e}")
+            return EXIT_ABORTED
+
+        if self.needs_merge and not self.backup_requested:
+            self.note("Ignoring --no-backup: backups are mandatory when merging into an existing destination.")
+            self.backup_effective = True
         else:
-            print("[1/9] Skipping backup (--no-backup)")
-            backup_dir = None
+            self.backup_effective = self.backup_requested
 
-        # Step 2-3: Rename encoded dirs + update session content (Claude state)
-        print("[2/9] Renaming path-encoded directories...")
-        self.execute_encoded_dirs()
+        if self.needs_merge and not assume_yes:
+            if confirm is None:
+                print("Refusing to merge non-interactively without confirmation. Pass --yes to proceed.")
+                return EXIT_ABORTED
+            if not confirm(self.new_abs):
+                print("Aborted — confirmation did not match.")
+                return EXIT_ABORTED
 
-        print("[3/9] Updating session file contents...")
-        self.execute_session_content()
-
-        # Step 4: Move directory (the irreversible step — all reads done, writes follow)
-        if self.context_only:
-            print("[4/9] Skipping directory move (--context-only)")
-        elif getattr(self, "_merge_mode", False):
-            print("[4/9] Merging directory contents...")
-            src = Path(self.old_abs)
-            dst = Path(self.new_abs)
-            for item in src.iterdir():
-                dest_item = dst / item.name
-                if not dest_item.exists():
-                    shutil.move(str(item), str(dest_item))
-                else:
-                    self.warn(f"Skipped {item.name} — already exists at destination")
+        print("[1/5] Creating backup...")
+        backup_dir = None
+        if self.backup_effective:
             try:
-                src.rmdir()
-            except OSError:
-                self.warn(f"Source dir not empty after merge — some files remain at {src}")
+                backup_dir = self.create_backup()
+            except Exception as e:
+                print(f"       ABORTED: backup failed: {e}")
+                print("       No changes have been made.")
+                return EXIT_ABORTED
+            print(f"       Backup: {backup_dir}" if backup_dir else "       No files to back up.")
         else:
-            print("[4/9] Moving directory...")
-            Path(self.old_abs).rename(Path(self.new_abs))
+            print("       Skipping backup (--no-backup)")
 
-        # Steps 5-8: Update all config/state files
-        print("[5/9] Updating history.jsonl...")
-        self.execute_history()
+        # A backup is a safety net, not a mutation of project/Claude state —
+        # self.mutated only flips to True at the point something is actually
+        # renamed, merged, written, or copied (see execute_encoded_dirs(),
+        # _write_planned_files(), and the directory-move block below).
+        self.backup_created = backup_dir is not None
 
-        print("[6/9] Updating ~/.claude.json...")
-        self.execute_claude_json()
+        print("[2/5] Renaming path-encoded Claude state directories...")
+        self.execute_encoded_dirs()
+        if self.errors:
+            return self._stop_stage(backup_dir, "renaming Claude state directories")
 
-        print("[7/9] Updating installed_plugins.json...")
-        self.execute_plugins()
+        print("[3/5] Updating history.jsonl, claude.json, plugins, settings, memory, and session files...")
+        self._write_planned_files()
+        if self.errors:
+            return self._stop_stage(backup_dir, "writing state files")
 
-        print("[8/9] Updating settings.local.json files...")
-        self.execute_project_settings()
-        self.execute_cross_project_settings()
+        if self.context_only:
+            print("[4/5] Skipping directory move (--context-only)")
+        elif self.case_only_rename:
+            print("[4/5] Case/format-only rename of project directory...")
+            try:
+                rename_case_only(Path(self.old_abs), Path(self.new_abs))
+                self.mutated = True
+            except OSError as e:
+                self.error(f"Case-only rename failed: {e}")
+        elif self.needs_merge:
+            print("[4/5] Merging directory contents (pre-verified conflict-free)...")
+            conflicts = scan_tree_conflicts(Path(self.old_abs), Path(self.new_abs), self.windows)
+            if conflicts:
+                self.error(f"Refusing to merge project directory: {len(conflicts)} conflict(s) appeared since preflight")
+            else:
+                try:
+                    move_tree_disjoint(Path(self.old_abs), Path(self.new_abs))
+                    self.mutated = True
+                except OSError as e:
+                    self.error(f"Directory merge failed: {e}")
+        else:
+            print("[4/5] Moving directory...")
+            try:
+                if same_volume(Path(self.old_abs), Path(self.new_abs), self.windows):
+                    Path(self.old_abs).rename(Path(self.new_abs))
+                    self.mutated = True
+                else:
+                    self._cross_volume_move()
+            except OSError as e:
+                self.error(f"Directory move failed: {e}")
 
-        print("[9/9] Updating memory files...")
-        self.execute_memory_files()
-
-        # Post-move verification
-        print(f"\nVerifying...")
+        print("[5/5] Verifying...")
         stale = self.verify_move()
 
+        print()
+        if self.notes:
+            print(f"Notes ({len(self.notes)}):")
+            for n in self.notes:
+                print(f"  - {n}")
+        if self.errors:
+            print(f"COMPLETED WITH ERRORS ({len(self.errors)}):")
+            for e in self.errors:
+                print(f"  ! {e}")
         if stale:
-            print(f"\n  STALE REFERENCES FOUND ({len(stale)}):")
+            print(f"STALE REFERENCES FOUND ({len(stale)}) — do not trust this move as fully complete:")
             for s in stale:
-                print(f"    ! {s}")
-            if backup_dir:
-                print(f"\n  Backup available at: {backup_dir}")
-        else:
-            print(f"  Verification passed — zero stale references.")
-
-        print(f"\nDone. Moved {self.old_abs} → {self.new_abs}")
-
-        if backup_dir:
-            print(f"Backup: {backup_dir}")
-
+                print(f"  ! {s}")
         if self.warnings:
-            print(f"\nWarnings ({len(self.warnings)}):")
+            print(f"Warnings ({len(self.warnings)}):")
             for w in self.warnings:
                 print(f"  ! {w}")
 
+        if backup_dir:
+            print(f"\nBackup: {backup_dir}")
+
+        if self.errors or stale:
+            print(f"\nFINISHED WITH PROBLEMS: {self.old_abs} -> {self.new_abs}")
+            return EXIT_PARTIAL if self.mutated else EXIT_ABORTED
+
+        if self.warnings:
+            # Warnings alone already force a non-zero exit code — never claim
+            # a clean "Done." in the same breath.
+            print(f"\nFINISHED WITH WARNINGS: {self.old_abs} -> {self.new_abs}")
+            return EXIT_PARTIAL
+
+        print(f"\nDone. Moved {self.old_abs} -> {self.new_abs}")
+        return EXIT_OK
+
+    @staticmethod
+    def _hash_file(path: Path) -> str:
+        """Streaming SHA-256 — files are read in fixed-size chunks so an
+        arbitrarily large file is never loaded fully into memory."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _verify_copy(self, src: Path, dst: Path) -> bool:
+        """Byte-for-byte verification of a copied tree: matching relative
+        paths, matching entry types, matching sizes, AND matching content
+        hashes — two same-size files with different bytes must fail this
+        check, not pass it.
+
+        Symlinks: the cross-volume copy is made with shutil.copytree(...,
+        symlinks=True), which preserves symlinks as symlinks (matching what
+        a same-volume rename does — it never follows or transforms them).
+        Verification mirrors that choice: a source symlink must correspond
+        to a destination symlink pointing at the same target text; we never
+        follow a symlink to compare the content it points at, since that
+        content may live entirely outside the tree being moved."""
+        try:
+            src_entries = sorted(str(p.relative_to(src)) for p in src.rglob("*"))
+            dst_entries = sorted(str(p.relative_to(dst)) for p in dst.rglob("*"))
+            if src_entries != dst_entries:
+                return False
+
+            for rel in src_entries:
+                s, d = src / rel, dst / rel
+                if os.path.islink(s) or os.path.islink(d):
+                    if not (os.path.islink(s) and os.path.islink(d)):
+                        return False
+                    if os.readlink(s) != os.readlink(d):
+                        return False
+                    continue
+                if s.is_dir() != d.is_dir():
+                    return False
+                if s.is_dir():
+                    continue
+                if s.stat().st_size != d.stat().st_size:
+                    return False
+                if self._hash_file(s) != self._hash_file(d):
+                    return False
+            return True
+        except OSError:
+            return False
+
+    def _make_staging_path(self, dest_parent: Path, dest_name: str) -> Path:
+        """A collision-resistant, clearly-recognizable staging directory
+        name, allocated beside the final destination (so the later
+        staging -> destination rename is same-volume and atomic). Never
+        reuses/overwrites an existing path — retries with a fresh random
+        suffix instead."""
+        for _ in range(5):
+            candidate = dest_parent / f".{dest_name}.project-move-staging-{uuid.uuid4().hex}"
+            if not candidate.exists():
+                return candidate
+        raise FileExistsError(
+            f"Could not allocate a unique staging path beside {dest_parent / dest_name} after 5 attempts"
+        )
+
+    def _cross_volume_move(self):
+        """Transactional cross-volume move: copy to a staging directory on
+        the destination volume, verify it byte-for-byte (content hashes,
+        not just sizes), and only then atomically rename staging -> the
+        real destination before removing the source. The source is never
+        touched until the destination is fully verified and finalized; if
+        anything goes wrong, the source stays intact and the (possibly
+        partial) staging copy is preserved for inspection rather than
+        silently discarded or half-exposed at the final destination path."""
+        dest_parent = Path(self.new_abs).parent
+        dest_name = Path(self.new_abs).name
+        try:
+            staging = self._make_staging_path(dest_parent, dest_name)
+        except FileExistsError as e:
+            self.error(str(e))
+            return
+
+        self.note(f"Cross-volume move detected — copying to staging area, verifying, then finalizing: {staging}")
+
+        try:
+            shutil.copytree(self.old_abs, staging, symlinks=True)
+        except OSError as e:
+            if staging.exists():
+                # copytree got partway before failing: the destination
+                # filesystem WAS mutated (disk space used, partial tree
+                # created), even though the final destination path was
+                # never touched.
+                self.mutated = True
+                self.error(
+                    f"Cross-volume staging copy failed partway ({e}). Source left intact at {self.old_abs}. "
+                    f"Partial staging copy preserved for inspection at {staging} — remove it manually once reviewed."
+                )
+            else:
+                self.error(f"Cross-volume staging copy failed before creating anything: {e}")
+            return
+
+        # The staging directory now fully exists on the destination volume —
+        # a real, successful mutation, independent of whether it ever gets
+        # finalized to the actual destination path.
+        self.mutated = True
+
+        if not self._verify_copy(Path(self.old_abs), staging):
+            self.error(
+                f"Cross-volume copy verification failed (content mismatch) — source left intact at {self.old_abs}. "
+                f"Staging copy preserved for inspection at {staging} — remove it manually once reviewed."
+            )
+            return
+
+        try:
+            staging.rename(Path(self.new_abs))
+        except OSError as e:
+            self.error(
+                f"Verified staging copy could not be finalized to {self.new_abs}: {e}. "
+                f"Source left intact at {self.old_abs}. Staging copy preserved at {staging}."
+            )
+            return
+
+        try:
+            shutil.rmtree(self.old_abs)
+        except OSError as e:
+            self.error(
+                f"Destination finalized at {self.new_abs}, but removing the source at {self.old_abs} failed: {e}. "
+                f"Remove {self.old_abs} manually once you've confirmed {self.new_abs} is correct."
+            )
+
+    def verify_move(self) -> list:
+        """Re-scan for stale references. Every item this run actually
+        planned to change (session files, history.jsonl, claude.json,
+        plugins, the project's own and cross-project settings.local.json,
+        memory files — everything in _replacement_plans) is re-checked here
+        through the same path-remapping logic used at write time, rather
+        than a separate hard-coded subset of file categories."""
+        stale = []
+        variants = build_logical_variants(self.old_abs, self.new_abs, self.home, self.windows)
+        checked_paths = set()
+
+        def check(path: Path, label: str, json_like: bool, jsonl: bool):
+            checked_paths.add(str(path))
+            if not path.exists():
+                return
+            try:
+                raw = read_text_lossless(path)
+            except OSError as e:
+                stale.append(f"{label}: could not verify ({e})")
+                return
+            if self.case_only_rename:
+                if jsonl:
+                    count = sum(count_case_sensitive_occurrences(line, variants, json_like) for line in raw.splitlines())
+                else:
+                    count = count_case_sensitive_occurrences(raw, variants, json_like)
+                if count > 0:
+                    stale.append(f"{label}: {count} stale (old-case) reference(s) remain")
+                return
+            result = edit_text(raw, variants, self.windows, json_like=json_like, jsonl=jsonl)
+            if result.ambiguous:
+                stale.append(f"{label}: {result.note}")
+            elif sum(result.counts.values()) > 0:
+                stale.append(f"{label}: {sum(result.counts.values())} stale reference(s) remain")
+
+        for path_str, result in self._replacement_plans.items():
+            if not result.changed:
+                continue
+            json_like, jsonl = self._plan_meta.get(path_str, (True, False))
+            path = self._remap_after_full_move(Path(path_str))
+            try:
+                label = str(path.relative_to(self.env.home))
+            except ValueError:
+                label = str(path)
+            check(path, label, json_like, jsonl)
+
+        # Any session file present at the destination that scanning didn't
+        # already cover (e.g. this run created the destination projects/
+        # dir fresh, so there was nothing to compare against at scan time).
+        session_dir = self.env.claude_dir / "projects" / self.new_encoded
+        if session_dir.exists():
+            for jsonl_file in session_dir.glob("*.jsonl"):
+                if str(jsonl_file) not in checked_paths:
+                    check(jsonl_file, f"session file: {jsonl_file.name}", True, True)
+
+        # The root-mirror directory (if any) is a SEPARATE, deliberately
+        # untouched location — its existence must never suppress checking
+        # the real, documented path-encoded state directories.
+        for subdir in PATH_ENCODED_DIRS:
+            old_path = self.env.claude_dir / subdir / self.old_encoded
+            if old_path.exists() and not self.case_only_rename:
+                stale.append(f"old encoded dir still exists: {subdir}/{self.old_encoded}")
+
+        if not self.context_only and not self.case_only_rename:
+            if Path(self.old_abs).exists() and not self.needs_merge:
+                stale.append(f"source directory still exists: {self.old_abs}")
+            if not Path(self.new_abs).exists():
+                stale.append(f"destination directory missing: {self.new_abs}")
+
+        return stale
+
+    # ---------------------------------------------------------------- reporting
+
     def print_plan(self):
-        """Print the dry-run plan."""
         print(f"\n{'='*60}")
-        print(f" PROJECT-MOVE — DRY RUN")
+        print(" PROJECT-MOVE — DRY RUN (read-only; nothing has been changed)")
         print(f"{'='*60}")
-        print(f"\n  From: {self.old_abs}")
-        print(f"    To: {self.new_abs}")
-        print(f"\n  Old encoded: {self.old_encoded}")
-        print(f"  New encoded: {self.new_encoded}")
+        print(f"\n  Platform:     {'Windows' if self.windows else 'POSIX'} ({platform.system()})")
+        print(f"  From:         {self.old_abs}")
+        print(f"  To:           {self.new_abs}")
+        print(f"  Relationship: {self.relationship}")
+        print(f"\n  Old encoded:  {self.old_encoded}")
+        print(f"  New encoded:  {self.new_encoded}")
+
+        if self.needs_merge:
+            print(f"\n  Destination exists — merge required (verified conflict-free).")
+        if self.case_only_rename:
+            print(f"\n  Source and destination are the same directory — case/format-only rename.")
+
+        if self.errors:
+            print(f"\n  Scan errors ({len(self.errors)}) — --execute would be refused until these are resolved:")
+            for e in self.errors:
+                print(f"    ! {e}")
 
         if self.warnings:
             print(f"\n  Warnings:")
@@ -726,27 +1522,49 @@ class ProjectMover:
 
         if self.context_only:
             print(f"  (directory already at new location — context-only mode)")
+        elif self.case_only_rename:
+            print(f"  + Rename directory (case/format only): {self.old_abs} -> {self.new_abs}")
         else:
-            print(f"  + Move directory: {self.old_abs} → {self.new_abs}")
+            print(f"  + Move directory: {self.old_abs} -> {self.new_abs}")
+
         ctx_flag = "--context-only " if self.context_only else ""
         print(f"\n{'='*60}")
-        print(f"  To execute: project-move {ctx_flag}{self.old_abs} {self.new_abs} --execute")
+        if self.errors:
+            print(f"  Cannot execute yet — resolve the scan errors above first.")
+        else:
+            print(f'  To execute: project-move {ctx_flag}"{self.old_abs}" "{self.new_abs}" --execute')
         print(f"{'='*60}\n")
 
 
-def main():
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def _confirm_destination(new_abs: str) -> bool:
+    print(f"\nThis will merge into the existing destination:\n  {new_abs}")
+    print("Type the destination path exactly to confirm, or press Enter to abort.")
+    try:
+        typed = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return typed == new_abs
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
+        prog="project-move",
         description="Seamlessly move Claude Code projects without losing state.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Dry-run by default. Use --execute to actually perform the move.",
+        epilog="Dry-run by default. Use --execute to actually perform the move. Run a dry-run first.",
     )
     parser.add_argument("old_path", help="Current (or former) project directory path")
     parser.add_argument("new_path", help="Destination path for the project")
     parser.add_argument("--execute", action="store_true", help="Actually perform the move (default: dry-run)")
-    parser.add_argument("--no-backup", action="store_true", help="Skip history.jsonl backup")
+    parser.add_argument("--no-backup", action="store_true", help="Skip backup for a plain (non-merge) move")
     parser.add_argument("--context-only", action="store_true", help="Update Claude state only — directory already moved")
+    parser.add_argument("--yes", "-y", action="store_true", help="Skip interactive confirmation (for scripts/CI)")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     mover = ProjectMover(
         old_path=args.old_path,
@@ -757,15 +1575,21 @@ def main():
     )
 
     if not mover.preflight():
-        sys.exit(1)
+        return EXIT_ABORTED
 
     mover.scan_all()
 
     if args.execute:
-        mover.execute_move()
-    else:
-        mover.print_plan()
+        if mover.errors:
+            print("ABORTED: required scans failed — refusing to execute:")
+            for e in mover.errors:
+                print(f"  ! {e}")
+            return EXIT_ABORTED
+        return mover.execute_move(assume_yes=args.yes, confirm=_confirm_destination)
+
+    mover.print_plan()
+    return EXIT_ABORTED if mover.errors else EXIT_OK
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
